@@ -1,0 +1,1 @@
+aarch64-linux-android-clang++ -O2 -o SoFixer64Static /data/local/tmp/SoFixer-Chenyangming9/ElfReader.cpp /data/local/tmp/SoFixer-Chenyangming9/ElfRebuilder.cpp /data/local/tmp/SoFixer-Chenyangming9/ObElfReader.cpp /data/local/tmp/SoFixer-Chenyangming9/main.cpp -std=c++14 -static-libstdc++ -lc++_static
