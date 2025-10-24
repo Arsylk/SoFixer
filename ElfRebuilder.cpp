@@ -1,7 +1,5 @@
 //===------------------------------------------------------------*- C++ -*-===//
-//
-//                     Created by F8LEFT on 2017/6/4.
-//                   Copyright (c) 2017. All rights reserved.
+//                     ARM64 ELF Rebuilder - Improved Version
 //===----------------------------------------------------------------------===//
 #include "ElfRebuilder.h"
 #include "FDebug.h"
@@ -10,1157 +8,1113 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <utility>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
-#ifdef __LP64__
-#define ADDRESS_FORMAT "ll"
-#else
-#define ADDRESS_FORMAT ""
-#define R_ARM_RELATIVE 23
-#define R_ARM_GLOB_DAT 21
-#define R_ARM_JUMP_SLOT 22
-#define R_ARM_ABS32 2
-#define R_ARM_IRELATIVE 160
-#endif
+using Elf_Addr = Elf64_Addr;
+using Elf_Off = Elf64_Off;
+using Elf_Ehdr = Elf64_Ehdr;
+using Elf_Phdr = Elf64_Phdr;
+using Elf_Shdr = Elf64_Shdr;
+using Elf_Sym = Elf64_Sym;
+using Elf_Dyn = Elf64_Dyn;
+using Elf_Rela = Elf64_Rela;
+using Elf_Addr_Type = uint64_t;
 
+class ImprovedElfRebuilder {
+public:
+  explicit ImprovedElfRebuilder(ObElfReader *reader) : elf_reader_(reader) {
+    if (!reader) {
+      throw std::runtime_error("Null ELF reader");
+    }
+  }
+
+  bool Rebuild() {
+    try {
+      if (!ParseDynamicSection()) {
+        FLOGE("Failed to parse dynamic section");
+        return false;
+      }
+
+      if (!RebuildProgramHeaders()) {
+        FLOGE("Failed to rebuild program headers");
+        return false;
+      }
+
+      if (!RebuildSectionHeaders()) {
+        FLOGE("Failed to rebuild section headers");
+        return false;
+      }
+
+      if (!ProcessRelocations()) {
+        FLOGE("Failed to process relocations");
+        return false;
+      }
+
+      if (!FinalizeRebuild()) {
+        FLOGE("Failed to finalize rebuild");
+        return false;
+      }
+
+      return true;
+    } catch (const std::exception &e) {
+      FLOGE("Rebuild exception: %s", e.what());
+      return false;
+    }
+  }
+
+  const uint8_t *GetRebuildData() const { return rebuild_data_.get(); }
+  size_t GetRebuildSize() const { return rebuild_size_; }
+  const std::vector<std::string> &GetImports() const { return imports_; }
+
+public:
+  struct SectionInfo {
+    std::string name;
+    uint32_t type;
+    uint64_t flags;
+    Elf_Addr addr;
+    Elf_Off offset;
+    uint64_t size;
+    uint32_t link;
+    uint32_t info;
+    uint64_t addralign;
+    uint64_t entsize;
+
+    SectionInfo(const std::string &n = "")
+        : name(n), type(SHT_NULL), flags(0), addr(0), offset(0), size(0),
+          link(0), info(0), addralign(1), entsize(0) {}
+  };
+
+  struct DynamicInfo {
+    Elf_Addr base = 0;
+    Elf_Addr load_bias = 0;
+    const Elf_Phdr *phdr = nullptr;
+    size_t phnum = 0;
+    Elf_Addr min_load = 0;
+    Elf_Addr max_load = 0;
+
+    const Elf_Dyn *dynamic = nullptr;
+    size_t dynamic_count = 0;
+
+    const Elf_Sym *symtab = nullptr;
+    const char *strtab = nullptr;
+    size_t strtab_size = 0;
+    size_t sym_count = 0;
+
+    const uint32_t *hash = nullptr;
+    uint32_t nbucket = 0;
+    uint32_t nchain = 0;
+
+    const uint32_t *gnu_hash = nullptr;
+
+    const Elf_Rela *rela_dyn = nullptr;
+    size_t rela_dyn_count = 0;
+
+    const Elf_Rela *rela_plt = nullptr;
+    size_t rela_plt_count = 0;
+
+    const Elf_Addr *pltgot = nullptr;
+
+    const void **init_array = nullptr;
+    size_t init_array_count = 0;
+
+    const void **fini_array = nullptr;
+    size_t fini_array_count = 0;
+  };
+
+  ObElfReader *elf_reader_;
+  DynamicInfo dyn_info_;
+  std::vector<SectionInfo> sections_;
+  std::string shstrtab_;
+  std::vector<std::string> imports_;
+  std::unordered_map<std::string, size_t> import_indices_;
+  std::unique_ptr<uint8_t[]> rebuild_data_;
+  size_t rebuild_size_ = 0;
+
+  // Parse dynamic section and populate dyn_info_
+  bool ParseDynamicSection() {
+    FLOGD("=== Parsing Dynamic Section ===");
+
+    dyn_info_.base = dyn_info_.load_bias = (Elf64_Addr)elf_reader_->load_bias();
+    dyn_info_.phdr = elf_reader_->loaded_phdr();
+    dyn_info_.phnum = elf_reader_->phdr_count();
+
+    if (!phdr_table_get_load_size(dyn_info_.phdr, dyn_info_.phnum,
+                                  &dyn_info_.min_load, &dyn_info_.max_load)) {
+      FLOGE("Failed to get load size");
+      return false;
+    }
+
+    dyn_info_.max_load += elf_reader_->pad_size_;
+
+    Elf_Word dynamic_flags = 0;
+    elf_reader_->GetDynamicSection(&dyn_info_.dynamic, &dyn_info_.dynamic_count,
+                                   &dynamic_flags);
+
+    if (!dyn_info_.dynamic) {
+      FLOGE("No dynamic section found");
+      return false;
+    }
+
+    FLOGD("Dynamic section: %p, count: %zu", dyn_info_.dynamic,
+          dyn_info_.dynamic_count);
+
+    // Parse all dynamic entries
+    for (const Elf_Dyn *d = dyn_info_.dynamic; d->d_tag != DT_NULL; ++d) {
+      ParseDynamicEntry(d);
+    }
+
+    // Calculate symbol count
+    if (!CalculateSymbolCount()) {
+      FLOGE("Failed to calculate symbol count");
+      return false;
+    }
+
+    FLOGD("Symbol count: %zu", dyn_info_.sym_count);
+    return true;
+  }
+
+  void ParseDynamicEntry(const Elf_Dyn *d) {
+    auto base = dyn_info_.load_bias;
+
+    switch (d->d_tag) {
+    case DT_SYMTAB:
+      dyn_info_.symtab =
+          reinterpret_cast<const Elf_Sym *>(base + d->d_un.d_ptr);
+      FLOGD("DT_SYMTAB: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_STRTAB:
+      dyn_info_.strtab = reinterpret_cast<const char *>(base + d->d_un.d_ptr);
+      FLOGD("DT_STRTAB: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_STRSZ:
+      dyn_info_.strtab_size = d->d_un.d_val;
+      FLOGD("DT_STRSZ: %zu", dyn_info_.strtab_size);
+      break;
+
+    case DT_HASH:
+      dyn_info_.hash = reinterpret_cast<const uint32_t *>(base + d->d_un.d_ptr);
+      dyn_info_.nbucket = dyn_info_.hash[0];
+      dyn_info_.nchain = dyn_info_.hash[1];
+      FLOGD("DT_HASH: nbucket=%u, nchain=%u", dyn_info_.nbucket,
+            dyn_info_.nchain);
+      break;
+
+    case DT_GNU_HASH:
+      dyn_info_.gnu_hash =
+          reinterpret_cast<const uint32_t *>(base + d->d_un.d_ptr);
+      FLOGD("DT_GNU_HASH: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_RELA:
+      dyn_info_.rela_dyn =
+          reinterpret_cast<const Elf_Rela *>(base + d->d_un.d_ptr);
+      FLOGD("DT_RELA: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_RELASZ:
+      dyn_info_.rela_dyn_count = d->d_un.d_val / sizeof(Elf_Rela);
+      FLOGD("DT_RELASZ: %zu entries", dyn_info_.rela_dyn_count);
+      break;
+
+    case DT_JMPREL:
+      dyn_info_.rela_plt =
+          reinterpret_cast<const Elf_Rela *>(base + d->d_un.d_ptr);
+      FLOGD("DT_JMPREL: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_PLTRELSZ:
+      dyn_info_.rela_plt_count = d->d_un.d_val / sizeof(Elf_Rela);
+      FLOGD("DT_PLTRELSZ: %zu entries", dyn_info_.rela_plt_count);
+      break;
+
+    case DT_PLTGOT:
+      dyn_info_.pltgot =
+          reinterpret_cast<const Elf_Addr *>(base + d->d_un.d_ptr);
+      FLOGD("DT_PLTGOT: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_INIT_ARRAY:
+      dyn_info_.init_array =
+          reinterpret_cast<const void **>(base + d->d_un.d_ptr);
+      FLOGD("DT_INIT_ARRAY: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_INIT_ARRAYSZ:
+      dyn_info_.init_array_count = d->d_un.d_val / sizeof(Elf_Addr);
+      FLOGD("DT_INIT_ARRAYSZ: %zu", dyn_info_.init_array_count);
+      break;
+
+    case DT_FINI_ARRAY:
+      dyn_info_.fini_array =
+          reinterpret_cast<const void **>(base + d->d_un.d_ptr);
+      FLOGD("DT_FINI_ARRAY: 0x%lx", d->d_un.d_ptr);
+      break;
+
+    case DT_FINI_ARRAYSZ:
+      dyn_info_.fini_array_count = d->d_un.d_val / sizeof(Elf_Addr);
+      FLOGD("DT_FINI_ARRAYSZ: %zu", dyn_info_.fini_array_count);
+      break;
+
+    case DT_PLTREL:
+      if (d->d_un.d_val != DT_RELA) {
+        FLOGW("Unexpected PLT relocation type: %lu (expected DT_RELA)",
+              d->d_un.d_val);
+      }
+      break;
+
+    default:
+      // Ignore other tags
+      break;
+    }
+  }
+
+  bool CalculateSymbolCount() {
+    if (!dyn_info_.symtab) {
+      return false;
+    }
+
+    // Try GNU hash first (more reliable)
+    if (dyn_info_.gnu_hash) {
+      const uint32_t *hash = dyn_info_.gnu_hash;
+      uint32_t nbuckets = hash[0];
+      uint32_t symoffset = hash[1];
+      uint32_t bloom_size = hash[2];
+
+      const uint32_t *buckets =
+          &hash[4 + bloom_size * 2]; // 2 = sizeof(Elf64_Addr)/sizeof(uint32_t)
+      const uint32_t *chain = &buckets[nbuckets];
+
+      dyn_info_.sym_count = symoffset;
+      for (uint32_t i = 0; i < nbuckets; ++i) {
+        if (buckets[i] >= symoffset) {
+          uint32_t idx = buckets[i];
+          // Follow chain until we hit the terminator bit
+          while (idx < 0x10000) { // Safety limit
+            if (chain[idx - symoffset] & 1) {
+              // Last symbol in chain
+              if (idx + 1 > dyn_info_.sym_count) {
+                dyn_info_.sym_count = idx + 1;
+              }
+              break;
+            }
+            ++idx;
+          }
+        }
+      }
+      return true;
+    }
+
+    // Fall back to traditional hash
+    if (dyn_info_.hash) {
+      dyn_info_.sym_count = dyn_info_.nchain;
+      return true;
+    }
+
+    // Last resort: estimate from string table size
+    if (dyn_info_.strtab && dyn_info_.strtab_size > 0) {
+      // Rough estimate: average symbol name ~20 bytes
+      dyn_info_.sym_count = dyn_info_.strtab_size / 20;
+      FLOGW("Estimating symbol count: %zu", dyn_info_.sym_count);
+      return true;
+    }
+
+    return false;
+  }
+
+  bool RebuildProgramHeaders() {
+    FLOGD("=== Rebuilding Program Headers ===");
+
+    // Normalize all PT_LOAD segments
+    Elf_Phdr *phdr = const_cast<Elf_Phdr *>(dyn_info_.phdr);
+    for (size_t i = 0; i < dyn_info_.phnum; ++i) {
+      if (phdr[i].p_type == PT_LOAD) {
+        phdr[i].p_filesz = phdr[i].p_memsz;
+        phdr[i].p_paddr = phdr[i].p_vaddr;
+        phdr[i].p_offset = phdr[i].p_vaddr;
+        FLOGD("PT_LOAD[%zu]: vaddr=0x%lx, memsz=0x%lx", i, phdr[i].p_vaddr,
+              phdr[i].p_memsz);
+      }
+    }
+
+    return true;
+  }
+
+  bool RebuildSectionHeaders() {
+    FLOGD("=== Rebuilding Section Headers ===");
+
+    sections_.clear();
+    shstrtab_.clear();
+    shstrtab_.push_back('\0'); // Null string at offset 0
+
+    // Add null section
+    sections_.emplace_back();
+
+    // Build sections in memory order
+    AddDynSymSection();
+    AddDynStrSection();
+    AddHashSection();
+    AddRelaDynSection();
+    AddRelaPltSection();
+    AddPltSection();
+    AddTextSection();
+    AddInitArraySection();
+    AddFiniArraySection();
+    AddDynamicSection();
+    AddGotSection();
+    AddDataSection();
+    AddBssSection();
+
+    // Add .shstrtab last (address-independent)
+    AddShStrTabSection();
+
+    // Sort sections by address (excluding null and shstrtab)
+    SortSections();
+
+    // Fix cross-references
+    FixSectionLinks();
+
+    FLOGD("Created %zu sections", sections_.size());
+    return true;
+  }
+
+  size_t AddStringToShStrTab(const std::string &str) {
+    size_t offset = shstrtab_.size();
+    shstrtab_.append(str);
+    shstrtab_.push_back('\0');
+    return offset;
+  }
+
+  void AddDynSymSection() {
+    if (!dyn_info_.symtab || dyn_info_.sym_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".dynsym");
+    sec.type = SHT_DYNSYM;
+    sec.flags = SHF_ALLOC;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.symtab) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.sym_count * sizeof(Elf_Sym);
+    sec.addralign = 8;
+    sec.entsize = sizeof(Elf_Sym);
+    sections_.push_back(sec);
+
+    FLOGD("Added .dynsym: addr=0x%lx, size=0x%lx, count=%zu", sec.addr,
+          sec.size, dyn_info_.sym_count);
+  }
+
+  void AddDynStrSection() {
+    if (!dyn_info_.strtab || dyn_info_.strtab_size == 0) {
+      return;
+    }
+
+    SectionInfo sec(".dynstr");
+    sec.type = SHT_STRTAB;
+    sec.flags = SHF_ALLOC;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.strtab) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.strtab_size;
+    sec.addralign = 1;
+    sections_.push_back(sec);
+
+    FLOGD("Added .dynstr: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddHashSection() {
+    if (dyn_info_.gnu_hash) {
+      SectionInfo sec(".gnu.hash");
+      sec.type = SHT_GNU_HASH;
+      sec.flags = SHF_ALLOC;
+      sec.addr =
+          reinterpret_cast<Elf_Addr>(dyn_info_.gnu_hash) - dyn_info_.load_bias;
+      sec.offset = sec.addr;
+
+      // Calculate size: header + bloom + buckets + chains
+      const uint32_t *hash = dyn_info_.gnu_hash;
+      uint32_t nbuckets = hash[0];
+      uint32_t symoffset = hash[1];
+      uint32_t bloom_size = hash[2];
+
+      sec.size = 16 +                            // header
+                 bloom_size * sizeof(Elf_Addr) + // bloom filter
+                 nbuckets * 4;                   // buckets
+
+      // Estimate chain size
+      if (dyn_info_.sym_count > symoffset) {
+        sec.size += (dyn_info_.sym_count - symoffset) * 4;
+      }
+
+      sec.addralign = 8;
+      sections_.push_back(sec);
+
+      FLOGD("Added .gnu.hash: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+
+    } else if (dyn_info_.hash) {
+      SectionInfo sec(".hash");
+      sec.type = SHT_HASH;
+      sec.flags = SHF_ALLOC;
+      sec.addr =
+          reinterpret_cast<Elf_Addr>(dyn_info_.hash) - dyn_info_.load_bias;
+      sec.offset = sec.addr;
+      sec.size = (dyn_info_.nbucket + dyn_info_.nchain + 2) * sizeof(uint32_t);
+      sec.addralign = 4;
+      sec.entsize = 4;
+      sections_.push_back(sec);
+
+      FLOGD("Added .hash: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+    }
+  }
+
+  void AddRelaDynSection() {
+    if (!dyn_info_.rela_dyn || dyn_info_.rela_dyn_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".rela.dyn");
+    sec.type = SHT_RELA;
+    sec.flags = SHF_ALLOC;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.rela_dyn) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.rela_dyn_count * sizeof(Elf_Rela);
+    sec.addralign = 8;
+    sec.entsize = sizeof(Elf_Rela);
+    sections_.push_back(sec);
+
+    FLOGD("Added .rela.dyn: addr=0x%lx, size=0x%lx, count=%zu", sec.addr,
+          sec.size, dyn_info_.rela_dyn_count);
+  }
+
+  void AddRelaPltSection() {
+    if (!dyn_info_.rela_plt || dyn_info_.rela_plt_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".rela.plt");
+    sec.type = SHT_RELA;
+    sec.flags = SHF_ALLOC | SHF_INFO_LINK;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.rela_plt) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.rela_plt_count * sizeof(Elf_Rela);
+    sec.addralign = 8;
+    sec.entsize = sizeof(Elf_Rela);
+    sections_.push_back(sec);
+
+    FLOGD("Added .rela.plt: addr=0x%lx, size=0x%lx, count=%zu", sec.addr,
+          sec.size, dyn_info_.rela_plt_count);
+  }
+
+  void AddPltSection() {
+    if (!dyn_info_.rela_plt || dyn_info_.rela_plt_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".plt");
+    sec.type = SHT_PROGBITS;
+    sec.flags = SHF_ALLOC | SHF_EXECINSTR;
+
+    // PLT typically follows .rela.plt
+    Elf_Addr plt_addr = reinterpret_cast<Elf_Addr>(dyn_info_.rela_plt) -
+                        dyn_info_.load_bias +
+                        dyn_info_.rela_plt_count * sizeof(Elf_Rela);
+    plt_addr = (plt_addr + 15) & ~15ULL; // 16-byte align
+
+    sec.addr = plt_addr;
+    sec.offset = sec.addr;
+    sec.size =
+        32 +
+        16 * dyn_info_.rela_plt_count; // ARM64: header(32) + entries(16 each)
+    sec.addralign = 16;
+    sections_.push_back(sec);
+
+    FLOGD("Added .plt: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddTextSection() {
+    // Find first executable PT_LOAD
+    Elf_Addr text_start = 0;
+    Elf_Addr text_end = 0;
+    bool found = false;
+
+    for (size_t i = 0; i < dyn_info_.phnum; ++i) {
+      const Elf_Phdr &phdr = dyn_info_.phdr[i];
+      if (phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
+        if (!found || phdr.p_vaddr < text_start) {
+          text_start = phdr.p_vaddr;
+          found = true;
+        }
+        Elf_Addr end = phdr.p_vaddr + phdr.p_memsz;
+        if (end > text_end) {
+          text_end = end;
+        }
+      }
+    }
+
+    if (!found) {
+      FLOGW("No executable segment found");
+      return;
+    }
+
+    SectionInfo sec(".text");
+    sec.type = SHT_PROGBITS;
+    sec.flags = SHF_ALLOC | SHF_EXECINSTR;
+    sec.addr = text_start;
+    sec.offset = sec.addr;
+    sec.size = text_end - text_start;
+    sec.addralign = 16;
+    sections_.push_back(sec);
+
+    FLOGD("Added .text: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddInitArraySection() {
+    if (!dyn_info_.init_array || dyn_info_.init_array_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".init_array");
+    sec.type = SHT_INIT_ARRAY;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.init_array) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.init_array_count * sizeof(Elf_Addr);
+    sec.addralign = 8;
+    sections_.push_back(sec);
+
+    FLOGD("Added .init_array: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddFiniArraySection() {
+    if (!dyn_info_.fini_array || dyn_info_.fini_array_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".fini_array");
+    sec.type = SHT_FINI_ARRAY;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.fini_array) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.fini_array_count * sizeof(Elf_Addr);
+    sec.addralign = 8;
+    sections_.push_back(sec);
+
+    FLOGD("Added .fini_array: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddDynamicSection() {
+    if (!dyn_info_.dynamic || dyn_info_.dynamic_count == 0) {
+      return;
+    }
+
+    SectionInfo sec(".dynamic");
+    sec.type = SHT_DYNAMIC;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.dynamic) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    sec.size = dyn_info_.dynamic_count * sizeof(Elf_Dyn);
+    sec.addralign = 8;
+    sec.entsize = sizeof(Elf_Dyn);
+    sections_.push_back(sec);
+
+    FLOGD("Added .dynamic: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddGotSection() {
+    if (!dyn_info_.pltgot) {
+      return;
+    }
+
+    SectionInfo sec(".got");
+    sec.type = SHT_PROGBITS;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr =
+        reinterpret_cast<Elf_Addr>(dyn_info_.pltgot) - dyn_info_.load_bias;
+    sec.offset = sec.addr;
+    // GOT size: 3 reserved + PLT entries
+    sec.size = (3 + dyn_info_.rela_plt_count) * sizeof(Elf_Addr);
+    sec.addralign = 8;
+    sec.entsize = sizeof(Elf_Addr);
+    sections_.push_back(sec);
+
+    FLOGD("Added .got: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddDataSection() {
+    // Find highest writable address used by known sections
+    Elf_Addr max_addr = 0;
+    for (const auto &sec : sections_) {
+      if (sec.flags & SHF_WRITE) {
+        Elf_Addr end = sec.addr + sec.size;
+        if (end > max_addr) {
+          max_addr = end;
+        }
+      }
+    }
+
+    if (max_addr == 0) {
+      // No writable sections found, use default
+      max_addr = dyn_info_.max_load / 2;
+    }
+
+    SectionInfo sec(".data");
+    sec.type = SHT_PROGBITS;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr = (max_addr + 7) & ~7ULL; // 8-byte align
+    sec.offset = sec.addr;
+    sec.size =
+        (dyn_info_.max_load > sec.addr) ? (dyn_info_.max_load - sec.addr) : 0;
+    sec.addralign = 8;
+    sections_.push_back(sec);
+
+    FLOGD("Added .data: addr=0x%lx, size=0x%lx", sec.addr, sec.size);
+  }
+
+  void AddBssSection() {
+    SectionInfo sec(".bss");
+    sec.type = SHT_NOBITS;
+    sec.flags = SHF_ALLOC | SHF_WRITE;
+    sec.addr = dyn_info_.max_load;
+    sec.offset = dyn_info_.max_load;
+    sec.size = 0; // BSS size unknown from memory dump
+    sec.addralign = 8;
+    sections_.push_back(sec);
+
+    FLOGD("Added .bss: addr=0x%lx", sec.addr);
+  }
+
+  void AddShStrTabSection() {
+    SectionInfo sec(".shstrtab");
+    sec.type = SHT_STRTAB;
+    sec.flags = 0;
+    sec.addr = 0;   // Will be placed at end of file
+    sec.offset = 0; // Will be set during finalization
+    sec.size = 0;   // Will be calculated
+    sec.addralign = 1;
+    sections_.push_back(sec);
+  }
+
+  void SortSections() {
+    // Separate sections with addresses from address-independent sections
+    std::vector<SectionInfo> addressed_sections;
+    std::vector<SectionInfo> unaddressed_sections;
+
+    // Skip null section at index 0
+    for (size_t i = 1; i < sections_.size(); ++i) {
+      if (sections_[i].addr > 0 && sections_[i].type != SHT_STRTAB) {
+        addressed_sections.push_back(sections_[i]);
+      } else {
+        unaddressed_sections.push_back(sections_[i]);
+      }
+    }
+
+    // Sort addressed sections by address
+    std::stable_sort(addressed_sections.begin(), addressed_sections.end(),
+                     [](const SectionInfo &a, const SectionInfo &b) {
+                       return a.addr < b.addr;
+                     });
+
+    // Rebuild sections vector: null + sorted addressed + unaddressed
+    sections_.clear();
+    sections_.emplace_back(); // Null section
+
+    for (auto &sec : addressed_sections) {
+      sections_.push_back(sec);
+    }
+    for (auto &sec : unaddressed_sections) {
+      sections_.push_back(sec);
+    }
+
+    // Now assign string table names
+    for (auto &sec : sections_) {
+      if (!sec.name.empty()) {
+        // Store name in shstrtab and remember offset (will be set in header)
+        AddStringToShStrTab(sec.name);
+      }
+    }
+  }
+
+  void FixSectionLinks() {
+    // Build name->index map
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < sections_.size(); ++i) {
+      if (!sections_[i].name.empty()) {
+        name_to_index[sections_[i].name] = i;
+      }
+    }
+
+    auto get_index = [&](const std::string &name) -> uint32_t {
+      auto it = name_to_index.find(name);
+      return (it != name_to_index.end()) ? it->second : 0;
+    };
+
+    // Fix links for each section type
+    for (auto &sec : sections_) {
+      if (sec.type == SHT_HASH || sec.type == SHT_GNU_HASH) {
+        sec.link = get_index(".dynsym");
+      } else if (sec.type == SHT_DYNSYM) {
+        sec.link = get_index(".dynstr");
+      } else if (sec.type == SHT_DYNAMIC) {
+        sec.link = get_index(".dynstr");
+      } else if (sec.type == SHT_RELA) {
+        sec.link = get_index(".dynsym");
+        if (sec.name == ".rela.plt") {
+          sec.info = get_index(".plt");
+        }
+      }
+    }
+
+    FLOGD("Fixed section links");
+  }
+
+  bool ProcessRelocations() {
+    FLOGD("=== Processing Relocations ===");
+
+    // Extract import symbols first
+    if (!ExtractImports()) {
+      FLOGW("Failed to extract imports");
+    }
+
+    if (elf_reader_->dump_so_base_ == 0) {
+      FLOGD("No dump base provided, skipping relocation fixes");
+      return true;
+    }
+
+    uint8_t *base = reinterpret_cast<uint8_t *>(dyn_info_.load_bias);
+    Elf_Addr dump_base = elf_reader_->dump_so_base_;
+
+    // Process .rela.dyn
+    if (dyn_info_.rela_dyn) {
+      FLOGD("Processing %zu .rela.dyn relocations", dyn_info_.rela_dyn_count);
+      for (size_t i = 0; i < dyn_info_.rela_dyn_count; ++i) {
+        ProcessRelocation(base, &dyn_info_.rela_dyn[i], dump_base);
+      }
+    }
+
+    // Process .rela.plt
+    if (dyn_info_.rela_plt) {
+      FLOGD("Processing %zu .rela.plt relocations", dyn_info_.rela_plt_count);
+      for (size_t i = 0; i < dyn_info_.rela_plt_count; ++i) {
+        ProcessRelocation(base, &dyn_info_.rela_plt[i], dump_base);
+      }
+    }
+
+    FLOGD("Relocation processing complete");
+    return true;
+  }
+
+  bool ExtractImports() {
+    if (!dyn_info_.symtab || !dyn_info_.strtab || dyn_info_.sym_count == 0) {
+      return false;
+    }
+
+    imports_.clear();
+    import_indices_.clear();
+
+    for (size_t i = 0; i < dyn_info_.sym_count; ++i) {
+      const Elf_Sym &sym = dyn_info_.symtab[i];
+
+      // Import symbols have: st_shndx == SHN_UNDEF and non-zero binding
+      if (sym.st_shndx == SHN_UNDEF && sym.st_name != 0 &&
+          ELF64_ST_BIND(sym.st_info) != STB_LOCAL) {
+
+        const char *name = dyn_info_.strtab + sym.st_name;
+        if (name && name[0] != '\0') {
+          import_indices_[name] = imports_.size();
+          imports_.push_back(name);
+          FLOGD("Import[%zu]: %s (sym_idx=%zu)", imports_.size() - 1, name, i);
+        }
+      }
+    }
+
+    FLOGD("Extracted %zu import symbols", imports_.size());
+    return true;
+  }
+
+  void ProcessRelocation(uint8_t *base, const Elf_Rela *rela,
+                         Elf_Addr dump_base) {
+    if (!rela) {
+      return;
+    }
+
+    uint32_t type = ELF64_R_TYPE(rela->r_info);
+    uint32_t sym = ELF64_R_SYM(rela->r_info);
+
+    // Validate offset
+    if (rela->r_offset >= dyn_info_.max_load) {
+      FLOGW("Invalid relocation offset: 0x%lx", rela->r_offset);
+      return;
+    }
+
+    Elf_Addr *reloc_ptr = reinterpret_cast<Elf_Addr *>(base + rela->r_offset);
+
+    switch (type) {
+    case R_AARCH64_NONE:
+      break;
+
+    case R_AARCH64_RELATIVE:
+      // Base + Addend -> just store addend (remove base)
+      *reloc_ptr = rela->r_addend;
+      break;
+
+    case R_AARCH64_GLOB_DAT:
+    case R_AARCH64_JUMP_SLOT:
+      ProcessGlobalRelocation(reloc_ptr, sym, rela->r_addend, dump_base);
+      break;
+
+    case R_AARCH64_ABS64:
+      // Absolute 64-bit address
+      if (sym < dyn_info_.sym_count && dyn_info_.symtab) {
+        const Elf_Sym &syminfo = dyn_info_.symtab[sym];
+        if (syminfo.st_value != 0) {
+          // Defined symbol: symbol_value + addend
+          *reloc_ptr = syminfo.st_value + rela->r_addend;
+        } else {
+          // Undefined: just addend
+          *reloc_ptr = rela->r_addend;
+        }
+      } else {
+        *reloc_ptr = rela->r_addend;
+      }
+      break;
+
+    case R_AARCH64_IRELATIVE:
+      // Indirect function: resolver address
+      *reloc_ptr = rela->r_addend;
+      FLOGD("IRELATIVE at 0x%lx -> 0x%lx", rela->r_offset, rela->r_addend);
+      break;
+
+    case R_AARCH64_COPY:
+      FLOGW("R_AARCH64_COPY relocation at 0x%lx (not handled)", rela->r_offset);
+      break;
+
+    case R_AARCH64_ABS32:
+      // 32-bit absolute relocation (rare on ARM64)
+      if (sym < dyn_info_.sym_count && dyn_info_.symtab) {
+        const Elf_Sym &syminfo = dyn_info_.symtab[sym];
+        uint32_t *ptr32 = reinterpret_cast<uint32_t *>(reloc_ptr);
+        *ptr32 = static_cast<uint32_t>(syminfo.st_value + rela->r_addend);
+      }
+      break;
+
+    default:
+      FLOGW("Unhandled relocation type %u at offset 0x%lx", type,
+            rela->r_offset);
+      break;
+    }
+  }
+
+  void ProcessGlobalRelocation(Elf_Addr *reloc_ptr, uint32_t sym_idx,
+                               Elf_Addr addend, Elf_Addr dump_base) {
+    if (sym_idx >= dyn_info_.sym_count || !dyn_info_.symtab) {
+      FLOGW("Invalid symbol index: %u (max: %zu)", sym_idx,
+            dyn_info_.sym_count);
+      return;
+    }
+
+    const Elf_Sym &sym = dyn_info_.symtab[sym_idx];
+
+    if (sym.st_value != 0) {
+      // Defined symbol: use symbol value
+      *reloc_ptr = sym.st_value;
+    } else {
+      // Undefined symbol (import): assign synthetic address
+      if (sym.st_name == 0 || !dyn_info_.strtab) {
+        FLOGW("Invalid symbol name for import");
+        *reloc_ptr = 0;
+        return;
+      }
+
+      const char *sym_name = dyn_info_.strtab + sym.st_name;
+      auto it = import_indices_.find(sym_name);
+
+      if (it != import_indices_.end()) {
+        // Place imports at end of .data section
+        Elf_Addr import_base = dyn_info_.max_load;
+        *reloc_ptr = import_base + it->second * sizeof(Elf_Addr);
+        FLOGD("Import '%s' -> 0x%lx", sym_name, *reloc_ptr);
+      } else {
+        FLOGW("Symbol '%s' not found in imports", sym_name);
+        *reloc_ptr = 0;
+      }
+    }
+  }
+
+  bool FinalizeRebuild() {
+    FLOGD("=== Finalizing Rebuild ===");
+
+    // Calculate file layout
+    Elf_Addr load_size = dyn_info_.max_load - dyn_info_.min_load;
+
+    // Update .shstrtab section with actual values
+    for (auto &sec : sections_) {
+      if (sec.name == ".shstrtab") {
+        sec.offset = load_size;
+        sec.addr = 0; // Not loaded in memory
+        sec.size = shstrtab_.size();
+        break;
+      }
+    }
+
+    Elf_Off shdr_offset = load_size + shstrtab_.size();
+    size_t shdr_table_size = sections_.size() * sizeof(Elf_Shdr);
+
+    rebuild_size_ = shdr_offset + shdr_table_size;
+    rebuild_data_ = std::make_unique<uint8_t[]>(rebuild_size_);
+
+    if (!rebuild_data_) {
+      FLOGE("Failed to allocate %zu bytes", rebuild_size_);
+      return false;
+    }
+
+    // Copy loaded memory
+    std::memcpy(rebuild_data_.get(),
+                reinterpret_cast<const void *>(dyn_info_.load_bias), load_size);
+
+    // Append .shstrtab
+    std::memcpy(rebuild_data_.get() + load_size, shstrtab_.data(),
+                shstrtab_.size());
+
+    // Build and append section header table
+    std::vector<Elf_Shdr> shdr_table = BuildSectionHeaderTable();
+    std::memcpy(rebuild_data_.get() + shdr_offset, shdr_table.data(),
+                shdr_table_size);
+
+    // Fix ELF header
+    if (!FixElfHeader(shdr_offset)) {
+      FLOGE("Failed to fix ELF header");
+      return false;
+    }
+
+    FLOGD("Rebuild complete: size=%zu bytes", rebuild_size_);
+    FLOGD("  Load size: %lu", load_size);
+    FLOGD("  .shstrtab size: %zu", shstrtab_.size());
+    FLOGD("  Section headers: %zu entries (%zu bytes)", sections_.size(),
+          shdr_table_size);
+
+    return true;
+  }
+
+  std::vector<Elf_Shdr> BuildSectionHeaderTable() {
+    std::vector<Elf_Shdr> shdr_table;
+    shdr_table.reserve(sections_.size());
+
+    // Build string table name offset map
+    std::unordered_map<std::string, size_t> name_offsets;
+    size_t offset = 1; // Skip null byte
+    for (const auto &sec : sections_) {
+      if (!sec.name.empty()) {
+        name_offsets[sec.name] = offset;
+        offset += sec.name.size() + 1;
+      }
+    }
+
+    // Convert SectionInfo to Elf_Shdr
+    for (const auto &sec : sections_) {
+      Elf_Shdr shdr = {0};
+
+      if (!sec.name.empty()) {
+        auto it = name_offsets.find(sec.name);
+        shdr.sh_name = (it != name_offsets.end()) ? it->second : 0;
+      }
+
+      shdr.sh_type = sec.type;
+      shdr.sh_flags = sec.flags;
+      shdr.sh_addr = sec.addr;
+      shdr.sh_offset = sec.offset;
+      shdr.sh_size = sec.size;
+      shdr.sh_link = sec.link;
+      shdr.sh_info = sec.info;
+      shdr.sh_addralign = sec.addralign;
+      shdr.sh_entsize = sec.entsize;
+
+      shdr_table.push_back(shdr);
+    }
+
+    return shdr_table;
+  }
+
+  bool FixElfHeader(Elf_Off shdr_offset) {
+    const Elf_Ehdr *orig_ehdr = elf_reader_->record_ehdr();
+    if (!orig_ehdr) {
+      FLOGE("No original ELF header");
+      return false;
+    }
+
+    Elf_Ehdr new_ehdr = *orig_ehdr;
+
+    // Set ELF identification
+    std::memcpy(new_ehdr.e_ident, ELFMAG, SELFMAG);
+    new_ehdr.e_ident[EI_CLASS] = ELFCLASS64;
+    new_ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
+    new_ehdr.e_ident[EI_VERSION] = EV_CURRENT;
+    new_ehdr.e_ident[EI_OSABI] = ELFOSABI_NONE;
+
+    // Set header fields
+    new_ehdr.e_type = ET_DYN;
+    new_ehdr.e_machine = EM_AARCH64;
+    new_ehdr.e_version = EV_CURRENT;
+
+    // Find .shstrtab index
+    uint16_t shstrndx = 0;
+    for (size_t i = 0; i < sections_.size(); ++i) {
+      if (sections_[i].name == ".shstrtab") {
+        shstrndx = i;
+        break;
+      }
+    }
+
+    new_ehdr.e_shoff = shdr_offset;
+    new_ehdr.e_shentsize = sizeof(Elf_Shdr);
+    new_ehdr.e_shnum = sections_.size();
+    new_ehdr.e_shstrndx = shstrndx;
+
+    // Copy to rebuild data
+    std::memcpy(rebuild_data_.get(), &new_ehdr, sizeof(Elf_Ehdr));
+
+    FLOGD("ELF header fixed: shnum=%u, shoff=0x%lx, shstrndx=%u",
+          new_ehdr.e_shnum, new_ehdr.e_shoff, new_ehdr.e_shstrndx);
+
+    return true;
+  }
+};
+
+// Public API wrapper to maintain compatibility
 ElfRebuilder::ElfRebuilder(ObElfReader *elf_reader) {
   elf_reader_ = elf_reader;
   external_pointer = 0;
   si = *((soinfo *)malloc(sizeof(soinfo)));
 }
 
-bool ElfRebuilder::RebuildPhdr() {
-  FLOGD("=============RebuildPhdr=========================");
-
-  auto phdr = (Elf_Phdr *)elf_reader_->loaded_phdr();
-  for (auto i = 0; i < elf_reader_->phdr_count(); i++) {
-    phdr->p_filesz = phdr->p_memsz;
-    phdr->p_paddr = phdr->p_vaddr;
-    phdr->p_offset = phdr->p_vaddr;
-    phdr++;
-  }
-  FLOGD("=====================RebuildPhdr End======================");
-  return true;
-}
-
-bool ElfRebuilder::RebuildShdr() {
-  FLOGD("=======================RebuildShdr=========================");
-
-  auto base = si.load_bias;
-  shstrtab.push_back('\0');
-
-  // Empty shdr
-  if (true) {
-    Elf_Shdr shdr = {0};
-    shdrs.push_back(shdr);
-  }
-
-  // gen .dynsym
-  if (si.symtab != nullptr) {
-    sDYNSYM = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".dynsym");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_DYNSYM;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = (uintptr_t)si.symtab - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = 0;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-#ifdef __LP64__
-    shdr.sh_addralign = 8;
-    shdr.sh_entsize = sizeof(Elf64_Sym);
-#else
-    shdr.sh_addralign = 4;
-    shdr.sh_entsize = sizeof(Elf32_Sym);
-#endif
-    shdrs.push_back(shdr);
-  }
-
-  // gen .dynstr
-  if (si.strtab != nullptr) {
-    sDYNSTR = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".dynstr");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_STRTAB;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = (uintptr_t)si.strtab - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.strtabsize;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 1;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .hash or .gnu.hash
-  if (si.gnu_hash != nullptr) {
-    sGNUHASH = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".gnu.hash");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_GNU_HASH;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = (uintptr_t)si.gnu_hash - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-
-    // Calculate gnu_hash size
-    uint32_t *hash_data = (uint32_t *)si.gnu_hash;
-    uint32_t nbuckets = hash_data[0];
-    uint32_t symoffset = hash_data[1];
-    uint32_t bloom_size = hash_data[2];
-
-    // Size = header(16) + bloom(bloom_size*8) + buckets(nbuckets*4) +
-    // chain(estimated)
-    shdr.sh_size = 16 + bloom_size * sizeof(Elf_Addr) + nbuckets * 4;
-    if (si.symtab && si.nchain > 0) {
-      shdr.sh_size += (si.nchain - symoffset) * 4;
-    }
-
-    shdr.sh_link = sDYNSYM;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 8;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  } else if (si.hash != nullptr) {
-    sHASH = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".hash");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_HASH;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = (uintptr_t)si.hash - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = (si.nbucket + si.nchain + 2) * sizeof(uint32_t);
-    shdr.sh_link = sDYNSYM;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 4;
-    shdr.sh_entsize = 4;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .rela.dyn (ARM64 uses RELA, not REL)
-  if (si.rela != nullptr && si.rela_count > 0) {
-    sRELADYN = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".rela.dyn");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_RELA;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = (uintptr_t)si.rela - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.rela_count * sizeof(Elf_Rela);
-    shdr.sh_link = sDYNSYM;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = sizeof(Elf_Addr);
-    shdr.sh_entsize = sizeof(Elf_Rela);
-    shdrs.push_back(shdr);
-  }
-
-  // gen .rela.plt (ARM64 PLT uses RELA)
-  if (si.plt_rela != nullptr && si.plt_rela_count > 0) {
-    sRELAPLT = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".rela.plt");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_RELA;
-    shdr.sh_flags = SHF_ALLOC | SHF_INFO_LINK;
-    shdr.sh_addr = (uintptr_t)si.plt_rela - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.plt_rela_count * sizeof(Elf_Rela);
-    shdr.sh_link = sDYNSYM;
-    shdr.sh_info = 0; // Will be set to .plt section index later
-    shdr.sh_addralign = sizeof(Elf_Addr);
-    shdr.sh_entsize = sizeof(Elf_Rela);
-    shdrs.push_back(shdr);
-  }
-
-  // gen .plt
-  if (si.plt_rela != nullptr && si.plt_rela_count > 0) {
-    sPLT = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".plt");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-
-    // Find PLT location (typically after .rela.plt)
-    if (sRELAPLT != 0) {
-      shdr.sh_addr = shdrs[sRELAPLT].sh_addr + shdrs[sRELAPLT].sh_size;
-      // Align to 16 bytes for ARM64
-      shdr.sh_addr = (shdr.sh_addr + 15) & ~15ULL;
-    } else {
-      shdr.sh_addr = 0; // Will be calculated later
-    }
-    shdr.sh_offset = shdr.sh_addr;
-#ifdef __LP64__
-    // ARM64 PLT: header(32 bytes) + entries(16 bytes each)
-    shdr.sh_size = 32 + 16 * si.plt_rela_count;
-    shdr.sh_addralign = 16;
-#else
-    // ARM32 PLT: header(20 bytes) + entries(12 bytes each)
-    shdr.sh_size = 20 + 12 * si.plt_rela_count;
-    shdr.sh_addralign = 4;
-#endif
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-
-    // Update .rela.plt sh_info to point to .plt
-    if (sRELAPLT != 0) {
-      shdrs[sRELAPLT].sh_info = sPLT;
-    }
-  }
-
-  // gen .text
-  if (si.plt_rel != nullptr || si.plt_rela != nullptr) {
-    sTEXTTAB = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".text");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-
-    if (sPLT != 0) {
-      shdr.sh_addr = shdrs[sPLT].sh_addr + shdrs[sPLT].sh_size;
-#ifdef __LP64__
-      shdr.sh_addr = (shdr.sh_addr + 15) & ~15ULL; // 16-byte align
-#else
-      shdr.sh_addr = (shdr.sh_addr + 7) & ~7ULL; // 8-byte align
-#endif
-    } else {
-      shdr.sh_addr = 0x1000; // Default
-    }
-
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = 0; // Will be calculated later
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-#ifdef __LP64__
-    shdr.sh_addralign = 16;
-#else
-    shdr.sh_addralign = 8;
-#endif
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .rodata (read-only data)
-  if (true) {
-    sRODATA = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".rodata");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC;
-    shdr.sh_addr = 0; // Will be calculated
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = 0;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 16;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .fini_array
-  if (si.fini_array != nullptr) {
-    sFINIARRAY = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".fini_array");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_FINI_ARRAY;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    shdr.sh_addr = (uintptr_t)si.fini_array - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.fini_array_count * sizeof(Elf_Addr);
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-#ifdef __LP64__
-    shdr.sh_addralign = 8;
-#else
-    shdr.sh_addralign = 4;
-#endif
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .init_array
-  if (si.init_array != nullptr) {
-    sINITARRAY = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".init_array");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_INIT_ARRAY;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    shdr.sh_addr = (uintptr_t)si.init_array - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.init_array_count * sizeof(Elf_Addr);
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = sizeof(Elf_Addr);
-    shdr.sh_entsize = 0;
-
-    shdrs.push_back(shdr);
-  }
-
-  // gen .dynamic
-  if (si.dynamic != nullptr) {
-    sDYNAMIC = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".dynamic");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_DYNAMIC;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    shdr.sh_addr = (uintptr_t)si.dynamic - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.dynamic_count * sizeof(Elf_Dyn);
-    shdr.sh_link = sDYNSTR;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = sizeof(Elf_Addr);
-    shdr.sh_entsize = sizeof(Elf_Dyn);
-
-    shdrs.push_back(shdr);
-  }
-
-  // gen .got (Global Offset Table)
-  if (si.plt_got != nullptr) {
-    sGOT = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".got");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    shdr.sh_addr = (uintptr_t)si.plt_got - (uintptr_t)base;
-    shdr.sh_offset = shdr.sh_addr;
-
-    // Estimate GOT size: 3 reserved entries + PLT entries
-    shdr.sh_size = (3 + si.plt_rela_count) * sizeof(Elf_Addr);
-
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = sizeof(Elf_Addr);
-    shdr.sh_entsize = sizeof(Elf_Addr);
-
-    shdrs.push_back(shdr);
-  }
-
-  // gen .data
-  if (true) {
-    sDATA = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".data");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-
-    // Find highest address so far
-    Elf_Addr max_addr = 0;
-    for (size_t i = 1; i < shdrs.size(); i++) {
-      Elf_Addr end = shdrs[i].sh_addr + shdrs[i].sh_size;
-      if (end > max_addr)
-        max_addr = end;
-    }
-
-    shdr.sh_addr = max_addr;
-    shdr.sh_offset = shdr.sh_addr;
-    shdr.sh_size = si.max_load - shdr.sh_addr;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 8;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .bss
-  if (true) {
-    sBSS = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".bss");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_NOBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    shdr.sh_addr = si.max_load;
-    shdr.sh_offset = si.max_load;
-    shdr.sh_size = 0;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 8;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // gen .shstrtab
-  if (true) {
-    sSHSTRTAB = shdrs.size();
-    Elf_Shdr shdr = {0};
-
-    shdr.sh_name = shstrtab.length();
-    shstrtab.append(".shstrtab");
-    shstrtab.push_back('\0');
-
-    shdr.sh_type = SHT_STRTAB;
-    shdr.sh_flags = 0;
-    shdr.sh_addr = si.max_load;
-    shdr.sh_offset = si.max_load;
-    shdr.sh_size = shstrtab.length();
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 1;
-    shdr.sh_entsize = 0;
-    shdrs.push_back(shdr);
-  }
-
-  // Sort sections by address using stable sort to maintain relative order
-  // Create index pairs for sorting
-  std::vector<std::pair<Elf_Addr, size_t>> addr_index_pairs;
-  for (size_t i = 1; i < shdrs.size(); i++) {
-    addr_index_pairs.emplace_back(shdrs[i].sh_addr, i);
-  }
-
-  // Sort by address (stable sort maintains original order for equal addresses)
-  std::stable_sort(
-      addr_index_pairs.begin(), addr_index_pairs.end(),
-      [](const std::pair<Elf_Addr, size_t> &a,
-         const std::pair<Elf_Addr, size_t> &b) { return a.first < b.first; });
-
-  // Create mapping from old indices to new indices
-  std::vector<size_t> index_map(shdrs.size());
-  index_map[0] = 0; // Keep null section at index 0
-
-  for (size_t i = 0; i < addr_index_pairs.size(); i++) {
-    size_t old_index = addr_index_pairs[i].second;
-    size_t new_index = i + 1; // +1 because index 0 is reserved for null section
-    index_map[old_index] = new_index;
-  }
-
-  // Reorder sections according to new mapping
-  std::vector<Elf_Shdr> sorted_shdrs(shdrs.size());
-  for (size_t i = 0; i < shdrs.size(); i++) {
-    sorted_shdrs[index_map[i]] = shdrs[i];
-  }
-  shdrs = std::move(sorted_shdrs);
-
-  // Update section index references using the mapping
-  auto updateIndex = [&index_map](Elf_Word &index) {
-    if (index != 0) {
-      index = index_map[index];
-    }
-  };
-
-  updateIndex(sDYNSYM);
-  updateIndex(sDYNSTR);
-  updateIndex(sHASH);
-  updateIndex(sGNUHASH);
-  updateIndex(sRELADYN);
-  updateIndex(sRELAPLT);
-  updateIndex(sPLT);
-  updateIndex(sTEXT);
-  updateIndex(sTEXTTAB);
-  updateIndex(sRODATA);
-  updateIndex(sFINIARRAY);
-  updateIndex(sINITARRAY);
-  updateIndex(sDYNAMIC);
-  updateIndex(sGOT);
-  updateIndex(sDATA);
-  updateIndex(sBSS);
-  updateIndex(sSHSTRTAB);
-
-  // Fix section links
-  if (sHASH != 0)
-    shdrs[sHASH].sh_link = sDYNSYM;
-  if (sGNUHASH != 0)
-    shdrs[sGNUHASH].sh_link = sDYNSYM;
-  if (sRELADYN != 0)
-    shdrs[sRELADYN].sh_link = sDYNSYM;
-  if (sRELAPLT != 0) {
-    shdrs[sRELAPLT].sh_link = sDYNSYM;
-    if (sPLT != 0)
-      shdrs[sRELAPLT].sh_info = sPLT;
-  }
-  if (sDYNAMIC != 0)
-    shdrs[sDYNAMIC].sh_link = sDYNSTR;
-  if (sDYNSYM != 0)
-    shdrs[sDYNSYM].sh_link = sDYNSTR;
-
-  // Calculate sizes for sections with sh_size = 0
-  if (sDYNSYM != 0 && shdrs[sDYNSYM].sh_size == 0) {
-    for (size_t i = sDYNSYM + 1; i < shdrs.size(); i++) {
-      if (shdrs[i].sh_addr > shdrs[sDYNSYM].sh_addr) {
-        shdrs[sDYNSYM].sh_size = shdrs[i].sh_addr - shdrs[sDYNSYM].sh_addr;
-        break;
-      }
-    }
-  }
-
-  if (sTEXT != 0 && shdrs[sTEXT].sh_size == 0) {
-    for (size_t i = sTEXT + 1; i < shdrs.size(); i++) {
-      if (shdrs[i].sh_addr > shdrs[sTEXT].sh_addr) {
-        shdrs[sTEXT].sh_size = shdrs[i].sh_addr - shdrs[sTEXT].sh_addr;
-        break;
-      }
-    }
-  }
-
-  if (sRODATA != 0 && shdrs[sRODATA].sh_size == 0) {
-    for (size_t i = sRODATA + 1; i < shdrs.size(); i++) {
-      if (shdrs[i].sh_addr > shdrs[sRODATA].sh_addr) {
-        shdrs[sRODATA].sh_size = shdrs[i].sh_addr - shdrs[sRODATA].sh_addr;
-        break;
-      }
-    }
-  }
-
-  FLOGD("=====================RebuildShdr End======================");
-  return true;
-}
-
 bool ElfRebuilder::Rebuild() {
-  return RebuildPhdr() && ReadSoInfo() && RebuildShdr() && RebuildRelocs() &&
-         RebuildFin();
-}
-
-bool ElfRebuilder::ReadSoInfo() {
-  FLOGD("=======================ReadSoInfo=========================");
-
-  si.base = si.load_bias = elf_reader_->load_bias();
-  si.phdr = elf_reader_->loaded_phdr();
-  si.phnum = elf_reader_->phdr_count();
-  auto base = si.load_bias;
-
-  phdr_table_get_load_size(si.phdr, si.phnum, &si.min_load, &si.max_load);
-  si.max_load += elf_reader_->pad_size_;
-
-  si.dynamic = nullptr;
-  si.dynamic_count = 0;
-  si.dynamic_flags = 0;
-
-  elf_reader_->GetDynamicSection(&si.dynamic, &si.dynamic_count,
-                                 &si.dynamic_flags);
-  if (si.dynamic == nullptr) {
-    FLOGD("No valid dynamic section");
-    return false;
-  }
-  FLOGD("dynamic: 0x%lx count: %zu", si.dynamic, si.dynamic_count);
-
-  // Initialize pointers
-  si.symtab = nullptr;
-  si.strtab = nullptr;
-  si.strtabsize = 0;
-  si.hash = nullptr;
-  si.gnu_hash = nullptr;
-  si.nbucket = 0;
-  si.nchain = 0;
-  si.bucket = nullptr;
-  si.chain = nullptr;
-  si.plt_got = nullptr;
-  si.plt_rela = nullptr;
-  si.plt_rela_count = 0;
-  si.rela = nullptr;
-  si.rela_count = 0;
-  si.rel = nullptr;
-  si.rel_count = 0;
-  si.init_array = nullptr;
-  si.init_array_count = 0;
-  si.fini_array = nullptr;
-  si.fini_array_count = 0;
-  si.init_func = nullptr;
-  si.fini_func = nullptr;
-
-  // Parse dynamic section
-  for (Elf_Dyn *d = si.dynamic; d->d_tag != DT_NULL; ++d) {
-    FLOGD("DT tag: 0x%lx value: 0x%lx", (unsigned long)d->d_tag,
-          (unsigned long)d->d_un.d_val);
-
-    switch (d->d_tag) {
-    case DT_HASH:
-      si.hash = base + d->d_un.d_ptr;
-      si.nbucket = ((uint32_t *)(base + d->d_un.d_ptr))[0];
-      si.nchain = ((uint32_t *)(base + d->d_un.d_ptr))[1];
-      si.bucket = (uint32_t *)(base + d->d_un.d_ptr + 8);
-      si.chain = (uint32_t *)(base + d->d_un.d_ptr + 8 + si.nbucket * 4);
-      FLOGD("DT_HASH: nbucket=%u nchain=%u", si.nbucket, si.nchain);
-      break;
-
-    case DT_GNU_HASH:
-      si.gnu_hash = base + d->d_un.d_ptr;
-      FLOGD("DT_GNU_HASH at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_STRTAB:
-      si.strtab = (const char *)(base + d->d_un.d_ptr);
-      FLOGD("DT_STRTAB at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_STRSZ:
-      si.strtabsize = d->d_un.d_val;
-      FLOGD("DT_STRSZ: %zu", si.strtabsize);
-      break;
-
-    case DT_SYMTAB:
-      si.symtab = (Elf_Sym *)(base + d->d_un.d_ptr);
-      FLOGD("DT_SYMTAB at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_SYMENT:
-      if (d->d_un.d_val != sizeof(Elf_Sym)) {
-        FLOGE("Invalid DT_SYMENT: %lu (expected %lu)",
-              (unsigned long)d->d_un.d_val, (unsigned long)sizeof(Elf_Sym));
-      }
-      break;
-
-    case DT_PLTREL:
-      si.plt_type = d->d_un.d_val;
-      FLOGD("DT_PLTREL: %lu (7=RELA, 17=REL)", (unsigned long)si.plt_type);
-      break;
-
-    case DT_JMPREL:
-      if (si.plt_type == DT_RELA || si.plt_type == 0) {
-        si.plt_rela = (Elf_Rela *)(base + d->d_un.d_ptr);
-      } else {
-        si.plt_rel = (Elf_Rel *)(base + d->d_un.d_ptr);
-      }
-      FLOGD("DT_JMPREL at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_PLTRELSZ:
-      if (si.plt_type == DT_RELA || si.plt_type == 0) {
-        si.plt_rela_count = d->d_un.d_val / sizeof(Elf_Rela);
-        FLOGD("DT_PLTRELSZ: %zu RELA entries", si.plt_rela_count);
-      } else {
-        si.plt_rel_count = d->d_un.d_val / sizeof(Elf_Rel);
-        FLOGD("DT_PLTRELSZ: %zu REL entries", si.plt_rel_count);
-      }
-      break;
-
-    case DT_RELA:
-      si.rela = (Elf_Rela *)(base + d->d_un.d_ptr);
-      FLOGD("DT_RELA at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_RELASZ:
-      si.rela_count = d->d_un.d_val / sizeof(Elf_Rela);
-      FLOGD("DT_RELASZ: %zu entries", si.rela_count);
-      break;
-
-    case DT_RELAENT:
-      if (d->d_un.d_val != sizeof(Elf_Rela)) {
-        FLOGE("Invalid DT_RELAENT: %lu (expected %lu)",
-              (unsigned long)d->d_un.d_val, (unsigned long)sizeof(Elf_Rela));
-      }
-      break;
-
-    case DT_REL:
-      si.rel = (Elf_Rel *)(base + d->d_un.d_ptr);
-      FLOGD("DT_REL at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_RELSZ:
-      si.rel_count = d->d_un.d_val / sizeof(Elf_Rel);
-      FLOGD("DT_RELSZ: %zu entries", si.rel_count);
-      break;
-
-    case DT_RELENT:
-      if (d->d_un.d_val != sizeof(Elf_Rel)) {
-        FLOGE("Invalid DT_RELENT: %lu (expected %lu)",
-              (unsigned long)d->d_un.d_val, (unsigned long)sizeof(Elf_Rel));
-      }
-      break;
-
-    case DT_PLTGOT:
-      si.plt_got = (Elf_Addr *)(base + d->d_un.d_ptr);
-      FLOGD("DT_PLTGOT at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_INIT:
-      si.init_func = (void *)(base + d->d_un.d_ptr);
-      FLOGD("DT_INIT at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_FINI:
-      si.fini_func = (void *)(base + d->d_un.d_ptr);
-      FLOGD("DT_FINI at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_INIT_ARRAY:
-      si.init_array = (void **)(base + d->d_un.d_ptr);
-      FLOGD("DT_INIT_ARRAY at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_INIT_ARRAYSZ:
-      si.init_array_count = d->d_un.d_val / sizeof(Elf_Addr);
-      FLOGD("DT_INIT_ARRAYSZ: %zu entries", si.init_array_count);
-      break;
-
-    case DT_FINI_ARRAY:
-      si.fini_array = (void **)(base + d->d_un.d_ptr);
-      FLOGD("DT_FINI_ARRAY at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_FINI_ARRAYSZ:
-      si.fini_array_count = d->d_un.d_val / sizeof(Elf_Addr);
-      FLOGD("DT_FINI_ARRAYSZ: %zu entries", si.fini_array_count);
-      break;
-
-    case DT_PREINIT_ARRAY:
-      si.preinit_array = (void **)(base + d->d_un.d_ptr);
-      FLOGD("DT_PREINIT_ARRAY at 0x%lx", d->d_un.d_ptr);
-      break;
-
-    case DT_PREINIT_ARRAYSZ:
-      si.preinit_array_count = d->d_un.d_val / sizeof(Elf_Addr);
-      FLOGD("DT_PREINIT_ARRAYSZ: %zu entries", si.preinit_array_count);
-      break;
-
-    case DT_TEXTREL:
-      si.has_text_relocations = true;
-      FLOGD("DT_TEXTREL present");
-      break;
-
-    case DT_SYMBOLIC:
-      si.has_DT_SYMBOLIC = true;
-      FLOGD("DT_SYMBOLIC present");
-      break;
-
-    case DT_FLAGS:
-      if (d->d_un.d_val & DF_TEXTREL) {
-        si.has_text_relocations = true;
-        FLOGD("DF_TEXTREL flag set");
-      }
-      if (d->d_un.d_val & DF_SYMBOLIC) {
-        si.has_DT_SYMBOLIC = true;
-        FLOGD("DF_SYMBOLIC flag set");
-      }
-      break;
-
-    case DT_SONAME:
-      si.soname = si.strtab + d->d_un.d_val;
-      FLOGD("DT_SONAME: %p", si.soname);
-      break;
-
-    case DT_NEEDED:
-    case DT_FLAGS_1:
-    case DT_VERSYM:
-    case DT_VERDEF:
-    case DT_VERDEFNUM:
-    case DT_VERNEED:
-    case DT_VERNEEDNUM:
-    case DT_RELCOUNT:
-    case DT_RELACOUNT:
-      // These are informational, no action needed
-      break;
-
-    default:
-      FLOGD("Unknown/unhandled DT tag: 0x%lx", (unsigned long)d->d_tag);
-      break;
-    }
-  }
-
-  FLOGD("=======================ReadSoInfo End=========================");
-  return true;
-}
-
-bool ElfRebuilder::RebuildFin() {
-  FLOGD("=======================RebuildFin=========================");
-
-  auto load_size = si.max_load - si.min_load;
-  rebuild_size =
-      load_size + shstrtab.length() + shdrs.size() * sizeof(Elf_Shdr);
-
-  rebuild_data = new uint8_t[rebuild_size];
-  if (!rebuild_data) {
-    FLOGE("Failed to allocate %zu bytes for rebuild", rebuild_size);
-    return false;
-  }
-
-  // Copy entire memory region
-  memcpy(rebuild_data, (void *)si.load_bias, load_size);
-
-  // Append .shstrtab
-  memcpy(rebuild_data + load_size, shstrtab.c_str(), shstrtab.length());
-
-  // Append section headers
-  auto shdr_off = load_size + shstrtab.length();
-  memcpy(rebuild_data + shdr_off, &shdrs[0], shdrs.size() * sizeof(Elf_Shdr));
-
-  // Fix ELF header
-  Elf_Ehdr ehdr = *elf_reader_->record_ehdr();
-  ehdr.e_type = ET_DYN;
-#ifdef __LP64__
-  ehdr.e_machine = EM_AARCH64;
-#else
-  ehdr.e_machine = EM_ARM;
-#endif
-  ehdr.e_version = EV_CURRENT;
-  ehdr.e_shnum = shdrs.size();
-  ehdr.e_shoff = shdr_off;
-  ehdr.e_shstrndx = sSHSTRTAB;
-  ehdr.e_shentsize = sizeof(Elf_Shdr);
-
-  memcpy(rebuild_data, &ehdr, sizeof(Elf_Ehdr));
-
-  FLOGD("Rebuilt ELF: size=%zu shnum=%u shoff=0x%lx shstrndx=%u", rebuild_size,
-        ehdr.e_shnum, (unsigned long)ehdr.e_shoff, ehdr.e_shstrndx);
-  FLOGD("=======================RebuildFin End=========================");
-  return true;
-}
-
-void ElfRebuilder::SaveImportSymNames() {
-  FLOGD("%p", &si);
-  if (si.symtab == nullptr || si.strtab == nullptr) {
-    FLOGD("No symbol table available");
-    return;
-  }
-  FLOGD("Symbol table available");
-
-  FLOGD("=======================SaveImportSymNames=========================");
-
-  mImports.clear();
-
-  // Calculate symbol count
-  size_t sym_count = 0;
-  if (si.gnu_hash) {
-    uint32_t *hash_data = (uint32_t *)si.gnu_hash;
-    uint32_t nbuckets = hash_data[0];
-    uint32_t symoffset = hash_data[1];
-    uint32_t bloom_size = hash_data[2];
-
-    uint32_t *buckets = &hash_data[4 + bloom_size * (sizeof(Elf_Addr) / 4)];
-    uint32_t *chain = &buckets[nbuckets];
-
-    // Find max symbol index
-    sym_count = symoffset;
-    for (uint32_t i = 0; i < nbuckets; i++) {
-      if (buckets[i] != 0) {
-        uint32_t idx = buckets[i];
-        while ((chain[idx - symoffset] & 1) == 0) {
-          idx++;
-        }
-        if (idx + 1 > sym_count) {
-          sym_count = idx + 1;
-        }
-      }
-    }
-  } else if (si.hash) {
-    sym_count = si.nchain;
-  } else {
-    FLOGD("No hash table, cannot determine symbol count");
-    return;
-  }
-
-  FLOGD("Total symbols: %zu", sym_count);
-
-  // Collect undefined symbols (imports)
-  for (size_t i = 0; i < sym_count; i++) {
-    Elf_Sym *sym = &si.symtab[i];
-
-    // Skip if not undefined (imports have st_shndx == 0 and st_value == 0)
-    if (sym->st_shndx != 0 || sym->st_value != 0) {
-      continue;
+  try {
+    ImprovedElfRebuilder rebuilder(elf_reader_);
+    if (!rebuilder.Rebuild()) {
+      return false;
     }
 
-    if (sym->st_name == 0) {
-      continue;
-    }
+    // Copy results
+    rebuild_size = rebuilder.GetRebuildSize();
+    rebuild_data = new uint8_t[rebuild_size];
+    std::memcpy(rebuild_data, rebuilder.GetRebuildData(), rebuild_size);
 
-    const char *symname = si.strtab + sym->st_name;
-    if (symname && symname[0] != '\0') {
-      mImports.push_back(symname);
-      FLOGD("Import #%zu: %s", mImports.size() - 1, symname);
-    }
-  }
+    // Copy imports
+    mImports = rebuilder.GetImports();
 
-  FLOGD("Found %zu import symbols", mImports.size());
-  FLOGD(
-      "=======================SaveImportSymNames End=========================");
-}
-
-int ElfRebuilder::GetIndexOfImports(const std::string &symName) {
-  for (size_t i = 0; i < mImports.size(); i++) {
-    if (mImports[i] == symName) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-template <bool isRela>
-void ElfRebuilder::relocate(uint8_t *base, Elf_Rel *rel, Elf_Addr dump_base) {
-  if (!rel)
-    return;
-
-  auto type = ELF_R_TYPE(rel->r_info);
-  auto sym = ELF_R_SYM(rel->r_info);
-  auto reloc_addr = base + rel->r_offset;
-
-#ifdef __LP64__
-  // ARM64 relocations
-  switch (type) {
-  case R_AARCH64_RELATIVE: {
-    // Relative relocation: *reloc_addr = base + addend
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (isRela) {
-      Elf_Rela *rela = (Elf_Rela *)rel;
-      *ptr = rela->r_addend; // Remove base, keep only addend
-    } else {
-      // For REL, value is already at location
-      if (*ptr > dump_base) {
-        *ptr = *ptr - dump_base;
-      }
-    }
-    break;
-  }
-
-  case R_AARCH64_GLOB_DAT:
-  case R_AARCH64_JUMP_SLOT: {
-    // GOT/PLT relocations
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-
-    if (sym < si.nchain && si.symtab) {
-      Elf_Sym *syminfo = &si.symtab[sym];
-
-      if (syminfo->st_value != 0) {
-        // Defined symbol
-        *ptr = syminfo->st_value;
-      } else {
-        // Undefined symbol (import)
-        auto load_size = si.max_load - si.min_load;
-
-        if (mImports.size() == 0) {
-          *ptr = load_size + external_pointer;
-          external_pointer += sizeof(Elf_Addr);
-        } else {
-          const char *symname = si.strtab + syminfo->st_name;
-          int nIndex = GetIndexOfImports(symname);
-          if (nIndex != -1) {
-            *ptr = load_size + nIndex * sizeof(Elf_Addr);
-          } else {
-            FLOGD("Symbol not in imports: %s", symname);
-          }
-        }
-      }
-    }
-    break;
-  }
-
-  case R_AARCH64_ABS64: {
-    // Absolute 64-bit relocation
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (isRela) {
-      Elf_Rela *rela = (Elf_Rela *)rel;
-      if (sym < si.nchain && si.symtab) {
-        Elf_Sym *syminfo = &si.symtab[sym];
-        *ptr = syminfo->st_value + rela->r_addend;
-      } else {
-        *ptr = rela->r_addend;
-      }
-    } else {
-      if (*ptr > dump_base) {
-        *ptr = *ptr - dump_base;
-      }
-    }
-    break;
-  }
-
-  case R_AARCH64_IRELATIVE: {
-    // Indirect function relocation
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (isRela) {
-      Elf_Rela *rela = (Elf_Rela *)rel;
-      *ptr = rela->r_addend; // Keep resolver address as offset
-    }
-    FLOGD("IRELATIVE relocation at 0x%lx", rel->r_offset);
-    break;
-  }
-
-  case R_AARCH64_COPY:
-    FLOGD("R_AARCH64_COPY relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-  case R_AARCH64_P32_ABS32:
-    FLOGD("R_AARCH64_P32_ABS32 relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-  case R_AARCH64_P32_ABS16:
-    FLOGD("R_AARCH64_P32_ABS16 relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-  case R_AARCH64_P32_PREL32:
-    FLOGD("R_AARCH64_P32_PREL32 relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-  case R_AARCH64_P32_PREL16:
-    FLOGD("R_AARCH64_P32_PREL16 relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-
-  default:
-    FLOGD("Unknown ARM64 relocation type: %lu at offset 0x%lx", type,
-          rel->r_offset);
-    break;
-  }
-#else
-  // ARM32 relocations
-  switch (type) {
-  case R_ARM_RELATIVE: {
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (*ptr > dump_base) {
-      *ptr = *ptr - dump_base;
-    }
-    break;
-  }
-
-  case R_ARM_GLOB_DAT:
-  case R_ARM_JUMP_SLOT: {
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-
-    if (sym < si.nchain && si.symtab) {
-      Elf_Sym *syminfo = &si.symtab[sym];
-
-      if (syminfo->st_value != 0) {
-        *ptr = syminfo->st_value;
-      } else {
-        auto load_size = si.max_load - si.min_load;
-
-        if (mImports.size() == 0) {
-          *ptr = load_size + external_pointer;
-          external_pointer += sizeof(Elf_Addr);
-        } else {
-          const char *symname = si.strtab + syminfo->st_name;
-          int nIndex = GetIndexOfImports(symname);
-          if (nIndex != -1) {
-            *ptr = load_size + nIndex * sizeof(Elf_Addr);
-          }
-        }
-      }
-    }
-    break;
-  }
-
-  case R_ARM_ABS32: {
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (*ptr > dump_base) {
-      *ptr = *ptr - dump_base;
-    }
-    break;
-  }
-
-  case R_ARM_IRELATIVE: {
-    Elf_Addr *ptr = (Elf_Addr *)reloc_addr;
-    if (*ptr > dump_base) {
-      *ptr = *ptr - dump_base;
-    }
-    FLOGD("IRELATIVE relocation at 0x%x", rel->r_offset);
-    break;
-  }
-
-  default:
-    FLOGD("Unknown ARM32 relocation type: %u at offset 0x%x", type,
-          rel->r_offset);
-    break;
-  }
-#endif
-}
-
-bool ElfRebuilder::RebuildRelocs() {
-  FLOGD("=======================RebuildRelocs=========================");
-
-  ElfRebuilder::SaveImportSymNames();
-  FLOGD("saved imports");
-
-  if (elf_reader_->dump_so_base_ == 0) {
-    FLOGD("No dump_so_base, skipping relocation fixes");
     return true;
+  } catch (const std::exception &e) {
+    FLOGE("Rebuild failed: %s", e.what());
+    return false;
   }
-
-  FLOGD("Fixing relocations (dump_base=0x%lx)", elf_reader_->dump_so_base_);
-
-  auto base = (uint8_t *)si.load_bias;
-
-  // Process .rela.dyn
-  if (si.rela) {
-    FLOGD("Processing %zu .rela.dyn entries", si.rela_count);
-    for (size_t i = 0; i < si.rela_count; i++) {
-      relocate<true>(base, (Elf_Rel *)&si.rela[i], elf_reader_->dump_so_base_);
-    }
-  }
-
-  // Process .rela.plt
-  if (si.plt_rela) {
-    FLOGD("Processing %zu .rela.plt entries", si.plt_rela_count);
-    for (size_t i = 0; i < si.plt_rela_count; i++) {
-      relocate<true>(base, (Elf_Rel *)&si.plt_rela[i],
-                     elf_reader_->dump_so_base_);
-    }
-  }
-
-  // Process .rel.dyn (if any - rare on ARM64)
-  if (si.rel) {
-    FLOGD("Processing %zu .rel.dyn entries", si.rel_count);
-    for (size_t i = 0; i < si.rel_count; i++) {
-      relocate<false>(base, &si.rel[i], elf_reader_->dump_so_base_);
-    }
-  }
-
-  // Process .rel.plt (if any - rare on ARM64)
-  if (si.plt_rel && si.plt_type == DT_REL) {
-    FLOGD("Processing %zu .rel.plt entries", si.plt_rel_count);
-    for (size_t i = 0; i < si.plt_rel_count; i++) {
-      relocate<false>(base, &si.plt_rel[i], elf_reader_->dump_so_base_);
-    }
-  }
-
-  FLOGD("=======================RebuildRelocs End======================");
-  return true;
 }

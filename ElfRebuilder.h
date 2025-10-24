@@ -198,12 +198,16 @@ public:
 };
 
 // Helper functions for phdr operations
-inline size_t phdr_table_get_load_size(const Elf_Phdr *phdr_table,
-                                       size_t phdr_count,
-                                       Elf_Addr *out_min_vaddr,
-                                       Elf_Addr *out_max_vaddr) {
+inline bool phdr_table_get_load_size(const Elf_Phdr *phdr_table,
+                                     size_t phdr_count, Elf_Addr *out_min_vaddr,
+                                     Elf_Addr *out_max_vaddr) {
+  if (!phdr_table || !out_min_vaddr || !out_max_vaddr || phdr_count == 0) {
+    return false;
+  }
+
   Elf_Addr min_vaddr = UINTPTR_MAX;
   Elf_Addr max_vaddr = 0;
+  bool found_load = false;
 
   for (size_t i = 0; i < phdr_count; ++i) {
     const Elf_Phdr *phdr = &phdr_table[i];
@@ -211,6 +215,8 @@ inline size_t phdr_table_get_load_size(const Elf_Phdr *phdr_table,
     if (phdr->p_type != PT_LOAD) {
       continue;
     }
+
+    found_load = true;
 
     if (phdr->p_vaddr < min_vaddr) {
       min_vaddr = phdr->p_vaddr;
@@ -222,13 +228,15 @@ inline size_t phdr_table_get_load_size(const Elf_Phdr *phdr_table,
     }
   }
 
-  if (min_vaddr > max_vaddr) {
-    min_vaddr = max_vaddr = 0;
+  if (!found_load || min_vaddr > max_vaddr) {
+    *out_min_vaddr = 0;
+    *out_max_vaddr = 0;
+    return false;
   }
 
   *out_min_vaddr = min_vaddr;
   *out_max_vaddr = max_vaddr;
-  return min_vaddr;
+  return true;
 }
 
 inline void phdr_table_get_out_exidx(const Elf_Phdr *phdr_table,
@@ -237,15 +245,14 @@ inline void phdr_table_get_out_exidx(const Elf_Phdr *phdr_table,
   *out_exidx = nullptr;
   *out_count = 0;
 
-  const Elf_Phdr* phdr = phdr_table;
-  const Elf_Phdr* phdr_limit = phdr + phdr_count;
-
+  const Elf_Phdr *phdr = phdr_table;
+  const Elf_Phdr *phdr_limit = phdr + phdr_count;
 
   for (phdr = phdr_table; phdr < phdr_limit; phdr++) {
 
     if (phdr->p_type != PT_ARM_EXIDX)
       continue;
-    *out_exidx = (uint32_t*)(base + phdr->p_vaddr);
+    *out_exidx = (uint32_t *)(base + phdr->p_vaddr);
     *out_count = (size_t)(phdr->p_memsz / sizeof(uint32_t));
     return;
   }

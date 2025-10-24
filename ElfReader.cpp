@@ -205,9 +205,9 @@ bool ElfReader::ReadProgramHeader() {
  * set to the minimum and maximum addresses of pages to be reserved,
  * or 0 if there is nothing to load.
  */
-size_t phdr_table_get_load_size(const Elf_Phdr *phdr_table, size_t phdr_count,
-                                Elf_Addr *out_min_vaddr,
-                                Elf_Addr *out_max_vaddr) {
+bool phdr_table_get_load_size(const Elf_Phdr *phdr_table, size_t phdr_count,
+                              Elf_Addr *out_min_vaddr,
+                              Elf_Addr *out_max_vaddr) {
 #ifdef __LP64__
   Elf_Addr min_vaddr = 0xFFFFFFFFFFFFFFFFU;
 #else
@@ -619,7 +619,8 @@ bool ElfReader::setSource(const char *source) {
   return true;
 }
 
-void ElfReader::GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count,
+void ElfReader::GetDynamicSection(const Elf_Dyn **dynamic,
+                                  size_t *dynamic_count,
                                   Elf_Word *dynamic_flags) {
   const Elf_Phdr *phdr = phdr_table_;
   const Elf_Phdr *phdr_limit = phdr + phdr_num_;

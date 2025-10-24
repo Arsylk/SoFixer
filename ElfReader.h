@@ -63,7 +63,7 @@ public:
 
   const Elf_Ehdr *record_ehdr() { return &header_; }
 
-protected:
+public:
   bool ReadElfHeader();
   bool VerifyElfHeader();
   bool ReadProgramHeader();
@@ -75,7 +75,7 @@ protected:
   // loaded_phdr.
   void ApplyPhdrTable();
 
-  virtual void GetDynamicSection(Elf_Dyn **dynamic, size_t *dynamic_count,
+  virtual void GetDynamicSection(const Elf_Dyn **dynamic, size_t *dynamic_count,
                                  Elf_Word *dynamic_flags);
 
   const char *name_;
@@ -100,14 +100,14 @@ protected:
   // Loaded phdr.
   const Elf_Phdr *loaded_phdr_;
 
-private:
+public:
   friend class ElfRebuilder;
   friend class ObElfReader;
 };
 
-size_t phdr_table_get_load_size(const Elf_Phdr *phdr_table, size_t phdr_count,
-                                Elf_Addr *min_vaddr = NULL,
-                                Elf_Addr *max_vaddr = NULL);
+bool phdr_table_get_load_size(const Elf_Phdr *phdr_table, size_t phdr_count,
+                              Elf_Addr *min_vaddr = NULL,
+                              Elf_Addr *max_vaddr = NULL);
 
 int phdr_table_protect_segments(const Elf_Phdr *phdr_table, int phdr_count,
                                 uint8_t *load_bias);
