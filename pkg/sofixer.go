@@ -8,13 +8,16 @@ import (
 )
 
 const (
-	ELFCLASS32 = 1
-	ELFCLASS64 = 2
-	PT_LOAD    = 1
-	PT_DYNAMIC = 2
-	PT_PHDR    = 6
-	ET_DYN     = 3
-	EM_AARCH64 = 183
+	ELFCLASS32      = 1
+	ELFCLASS64      = 2
+	PT_LOAD         = 1
+	PT_DYNAMIC      = 2
+	PT_PHDR         = 6
+	PT_GNU_EH_FRAME = 0x6474e550
+	PT_GNU_STACK    = 0x6474e551
+	PT_GNU_RELRO    = 0x6474e552
+	ET_DYN          = 3
+	EM_AARCH64      = 183
 )
 
 // ELFHeader represents the main ELF header structure (e_ident + rest of header).
@@ -176,6 +179,27 @@ func fixProgramHeaders(file *os.File, header *ELFHeader, phdrs []ProgramHeader, 
 			phdr.Vaddr = header.PhdrOffset
 			phdr.Paddr = header.PhdrOffset
 			phdr.Offset = header.PhdrOffset
+		}
+
+		// Fix GNU-specific headers: PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK
+		if phdr.Type == PT_GNU_EH_FRAME || phdr.Type == PT_GNU_RELRO || phdr.Type == PT_GNU_STACK {
+			if needsConversion {
+				if phdr.Vaddr < baseAddr {
+					return fmt.Errorf("GNU segment Vaddr 0x%x is less than base address 0x%x", phdr.Vaddr, baseAddr)
+				}
+				relativeVaddr := phdr.Vaddr - baseAddr
+				phdr.Offset = relativeVaddr
+				phdr.Vaddr = relativeVaddr
+				phdr.Paddr = relativeVaddr
+			} else {
+				// If already relative, ensure Offset/Paddr consistency
+				phdr.Offset = phdr.Vaddr
+				phdr.Paddr = phdr.Vaddr
+			}
+			// Also ensure Filesz = Memsz for consistency, especially for PT_GNU_RELRO
+			if phdr.Type == PT_GNU_RELRO {
+				phdr.Filesz = phdr.Memsz
+			}
 		}
 
 		// Fix PT_DYNAMIC: it points to the dynamic section.
