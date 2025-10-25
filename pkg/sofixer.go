@@ -194,7 +194,7 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 		return fmt.Errorf("failed to write fixed program header table: %w", err)
 	}
 
-	// 5. Rewrite the fixed ELF header (in case any fields were modified)
+	// 8. Rewrite the fixed ELF header (in case any fields were modified)
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to ELF header for writing: %w", err)
 	}
@@ -254,11 +254,16 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		{Name: "", Type: SHT_NULL, Addralign: 1}, // Null section at index 0
 	}
 	shstrtab := "\x00" // Section Header String Table starts with null byte
+	shNameOffsets := make(map[string]uint32)
 
 	// Helper to add string to shstrtab and return offset
 	addShStr := func(name string) uint32 {
+		if offset, ok := shNameOffsets[name]; ok {
+			return offset
+		}
 		offset := uint32(len(shstrtab))
 		shstrtab += name + "\x00"
+		shNameOffsets[name] = offset
 		return offset
 	}
 
@@ -339,60 +344,16 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	}
 
 	// Add .text (approximation: first PT_LOAD segment)
-	if phdrs[1].Type == PT_LOAD {
-		addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, phdrs[1].Vaddr, phdrs[1].Filesz, 16, 0)
-	}
-
-	// Add .dynsym
-	// We don't have DT_SYMENT, so we assume 24 bytes (Elf64_Sym)
-	if dynMap[DT_SYMTAB] != 0 {
-		// We need to estimate the size of the symbol table.
-		// A common heuristic is to use the size of the string table as a proxy,
-		// but for now, we'll just add the section and rely on external tools to fix the size.
-		// For simplicity and to enable linking, we'll use a placeholder size.
-		// The actual size is hard to determine without DT_SYMENT and symbol count.
-		// We'll use a large enough size to cover the symbol table.
-		// The C++ code calculates symbol count from hash tables, which is complex.
-		// For now, we'll use the size of the string table as a rough upper bound for the symbol table size.
-		symtabSize := dynMap[DT_STRSZ] * 2 // Rough estimate
-		if symtabSize == 0 {
-			symtabSize = 0x1000 // Default if STRSIZ is missing
+	// We use the first PT_LOAD segment that is executable (R E)
+	var textPhdr *ProgramHeader
+	for _, phdr := range phdrs {
+		if phdr.Type == PT_LOAD && (phdr.Flags&SHF_EXECINSTR) != 0 {
+			textPhdr = &phdr
+			break
 		}
-		addSection(".dynsym", SHT_DYNSYM, SHF_ALLOC, dynMap[DT_SYMTAB], symtabSize, 8, 24)
 	}
-
-	// Add .gnu.hash
-	if dynMap[DT_GNU_HASH] != 0 {
-		// Size is complex to calculate, use a placeholder size.
-		addSection(".gnu.hash", SHT_GNU_HASH, SHF_ALLOC, dynMap[DT_GNU_HASH], 0x1000, 8, 4)
-	}
-
-	// Add .dynamic
-	addSection(".dynamic", SHT_DYNAMIC, SHF_ALLOC|SHF_WRITE, dynamicPhdr.Vaddr, dynamicPhdr.Memsz, dynamicPhdr.Align, 16)
-
-	// Add .rela.dyn
-	if dynMap[DT_RELA] != 0 && dynMap[DT_RELASZ] != 0 {
-		addSection(".rela.dyn", SHT_RELA, SHF_ALLOC, dynMap[DT_RELA], dynMap[DT_RELASZ], 8, 24)
-	}
-
-	// Add .rela.plt
-	if dynMap[DT_JMPREL] != 0 && dynMap[DT_PLTRELSZ] != 0 {
-		addSection(".rela.plt", SHT_RELA, SHF_ALLOC|SHF_INFO_LINK, dynMap[DT_JMPREL], dynMap[DT_PLTRELSZ], 8, 24)
-	}
-
-	// Add .init_array
-	if dynMap[DT_INIT_ARRAY] != 0 && dynMap[DT_INIT_ARRAYSZ] != 0 {
-		addSection(".init_array", SHT_INIT_ARRAY, SHF_ALLOC|SHF_WRITE, dynMap[DT_INIT_ARRAY], dynMap[DT_INIT_ARRAYSZ], 8, 8)
-	}
-
-	// Add .fini_array
-	if dynMap[DT_FINI_ARRAY] != 0 && dynMap[DT_FINI_ARRAYSZ] != 0 {
-		addSection(".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE, dynMap[DT_FINI_ARRAY], dynMap[DT_FINI_ARRAYSZ], 8, 8)
-	}
-
-	// Add .text (approximation: first PT_LOAD segment)
-	if phdrs[1].Type == PT_LOAD {
-		addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, phdrs[1].Vaddr, phdrs[1].Filesz, 16, 0)
+	if textPhdr != nil {
+		addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, textPhdr.Vaddr, textPhdr.Filesz, 16, 0)
 	}
 
 	// Add .shstrtab (Section Header String Table)
@@ -408,17 +369,21 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	for i := range sections {
 		if sections[i].Name != "" {
 			nameToIndex[sections[i].Name] = uint32(i)
-			sections[i].Offset = uint64(addShStr(sections[i].Name)) // Store string table offset in Offset temporarily
+			// Add string to shstrtab to populate shNameOffsets map
+			addShStr(sections[i].Name)
 		}
 	}
 
 	// Fix sh_link and sh_info
 	dynsymIndex := nameToIndex[".dynsym"]
 	dynstrIndex := nameToIndex[".dynstr"]
-	pltIndex := nameToIndex[".plt"] // Placeholder for .plt, which is not explicitly added yet
+	// We don't have a .plt section, but we can approximate its index for the .rela.plt info field.
+	// For now, we'll use the index of the .text section as a placeholder for the .plt section's info link.
+	pltIndex := nameToIndex[".text"]
 
 	for i := range sections {
 		sec := &sections[i]
+
 		switch sec.Name {
 		case ".dynsym":
 			sec.Link = dynstrIndex
@@ -432,7 +397,7 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 			sec.Link = dynsymIndex
 		case ".rela.plt":
 			sec.Link = dynsymIndex
-			sec.Info = pltIndex // Link to .plt section
+			sec.Info = pltIndex // Link to .text section as a placeholder for .plt
 		}
 	}
 
@@ -458,7 +423,7 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	for i := range sections {
 		sec := &sections[i]
 		shdr := SectionHeader{
-			Name:      uint32(sec.Offset), // Use the temporary offset as the final sh_name
+			Name:      shNameOffsets[sec.Name], // Use the calculated offset from the map
 			Type:      sec.Type,
 			Flags:     sec.Flags,
 			Addr:      sec.Addr,
@@ -469,8 +434,9 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 			Addralign: sec.Addralign,
 			Entsize:   sec.Entsize,
 		}
-		if sec.Name == ".shstrtab" {
-			shdr.Name = uint32(nameToIndex[".shstrtab"])
+		// The .shstrtab section header itself must have its Name field set to its own offset in the string table.
+		if uint32(i) == shstrtabSectionIndex {
+			shdr.Name = shNameOffsets[".shstrtab"]
 		}
 
 		if err := binary.Write(file, binary.LittleEndian, shdr); err != nil {
