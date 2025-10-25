@@ -35,12 +35,25 @@ const (
 	DT_INIT_ARRAYSZ = 27
 	DT_FINI_ARRAYSZ = 28
 	DT_GNU_HASH     = 0x6ffffef5
+	// AArch64 Relocation Types
+	R_AARCH64_NONE      = 0
+	R_AARCH64_RELATIVE  = 1027
+	R_AARCH64_GLOB_DAT  = 1025
+	R_AARCH64_JUMP_SLOT = 1026
+	R_AARCH64_ABS64     = 257
 )
 
 // DynamicEntry represents a 64-bit dynamic section entry (Elf64_Dyn).
 type DynamicEntry struct {
 	Tag uint64 // Dynamic entry type
 	Val uint64 // Value or pointer
+}
+
+// RelocationEntry represents a 64-bit relocation entry with explicit addend (Elf64_Rela).
+type RelocationEntry struct {
+	Offset uint64 // Address of reference
+	Info   uint64 // Symbol index and type of relocation
+	Addend int64  // Constant addend
 }
 
 // ELFHeader represents the main ELF header structure (e_ident + rest of header).
@@ -129,7 +142,12 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 		return fmt.Errorf("dynamic section fix failed: %w", err)
 	}
 
-	// 5. Rewrite the fixed PHT back to the file
+	// 5. Fix Relocations
+	if err := fixRelocations(file, phdrs, baseAddr); err != nil {
+		return fmt.Errorf("relocation fix failed: %w", err)
+	}
+
+	// 6. Rewrite the fixed PHT back to the file
 	if _, err := file.Seek(int64(header.PhdrOffset), io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to program header table for writing: %w", err)
 	}
@@ -143,6 +161,114 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 	}
 	if err := binary.Write(file, binary.LittleEndian, &header); err != nil {
 		return fmt.Errorf("failed to write fixed ELF header: %w", err)
+	}
+
+	return nil
+}
+
+// fixRelocations reads the relocation tables and fixes the pointers they reference.
+func fixRelocations(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error {
+	var dynamicPhdr *ProgramHeader
+	for i := range phdrs {
+		if phdrs[i].Type == PT_DYNAMIC {
+			dynamicPhdr = &phdrs[i]
+			break
+		}
+	}
+
+	if dynamicPhdr == nil {
+		return nil
+	}
+
+	// Read the fixed dynamic section to get relocation table info
+	entryCount := dynamicPhdr.Memsz / 16
+	dynamicEntries := make([]DynamicEntry, entryCount)
+	if _, err := file.Seek(int64(dynamicPhdr.Offset), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to dynamic section for reading: %w", err)
+	}
+	if err := binary.Read(file, binary.LittleEndian, &dynamicEntries); err != nil {
+		return fmt.Errorf("failed to read dynamic section for relocation info: %w", err)
+	}
+
+	var relaOffset, relaSize, jmprelOffset, jmprelSize uint64
+	for _, entry := range dynamicEntries {
+		switch entry.Tag {
+		case DT_RELA:
+			relaOffset = entry.Val
+		case DT_RELASZ:
+			relaSize = entry.Val
+		case DT_JMPREL:
+			jmprelOffset = entry.Val
+		case DT_PLTRELSZ:
+			jmprelSize = entry.Val
+		}
+	}
+
+	// Helper function to process a single relocation table
+	processTable := func(offset, size uint64) error {
+		if size == 0 {
+			return nil
+		}
+		if size%uint64(binary.Size(RelocationEntry{})) != 0 {
+			return fmt.Errorf("relocation table size 0x%x is not a multiple of entry size 0x%x", size, binary.Size(RelocationEntry{}))
+		}
+
+		numEntries := size / uint64(binary.Size(RelocationEntry{}))
+		relocations := make([]RelocationEntry, numEntries)
+
+		// Read the relocation table
+		if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek to relocation table at 0x%x: %w", offset, err)
+		}
+		if err := binary.Read(file, binary.LittleEndian, &relocations); err != nil {
+			return fmt.Errorf("failed to read relocation table at 0x%x: %w", offset, err)
+		}
+
+		// Fix each relocation entry
+		for i := range relocations {
+			rel := &relocations[i]
+			relType := rel.Info & 0xFFFFFFFF // Lower 32 bits is the type
+
+			// Only fix R_AARCH64_RELATIVE relocations
+			if relType == R_AARCH64_RELATIVE {
+				// The pointer at rel.Offset is a runtime address.
+				// We need to read the pointer, subtract the baseAddr, and write it back.
+
+				// 1. Read the pointer value at rel.Offset
+				var pointerVal uint64
+				if _, err := file.Seek(int64(rel.Offset), io.SeekStart); err != nil {
+					return fmt.Errorf("failed to seek to relocation target 0x%x: %w", rel.Offset, err)
+				}
+				if err := binary.Read(file, binary.LittleEndian, &pointerVal); err != nil {
+					return fmt.Errorf("failed to read relocation target at 0x%x: %w", rel.Offset, err)
+				}
+
+				// 2. Fix the pointer: pointerVal = pointerVal - baseAddr
+				if pointerVal < baseAddr {
+					// This should not happen for a runtime address, but check for robustness
+					return fmt.Errorf("R_AARCH64_RELATIVE target 0x%x is less than base address 0x%x", pointerVal, baseAddr)
+				}
+				fixedPointerVal := pointerVal - baseAddr
+
+				// 3. Write the fixed pointer back
+				if _, err := file.Seek(int64(rel.Offset), io.SeekStart); err != nil {
+					return fmt.Errorf("failed to seek to relocation target 0x%x for writing: %w", rel.Offset, err)
+				}
+				if err := binary.Write(file, binary.LittleEndian, fixedPointerVal); err != nil {
+					return fmt.Errorf("failed to write fixed relocation target at 0x%x: %w", rel.Offset, err)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	// Process DT_RELA and DT_JMPREL tables
+	if err := processTable(relaOffset, relaSize); err != nil {
+		return fmt.Errorf("DT_RELA fix failed: %w", err)
+	}
+	if err := processTable(jmprelOffset, jmprelSize); err != nil {
+		return fmt.Errorf("DT_JMPREL fix failed: %w", err)
 	}
 
 	return nil
