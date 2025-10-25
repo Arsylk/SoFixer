@@ -18,7 +18,30 @@ const (
 	PT_GNU_RELRO    = 0x6474e552
 	ET_DYN          = 3
 	EM_AARCH64      = 183
+
+	// Dynamic Tag Constants (DT_TAG)
+	DT_NULL         = 0
+	DT_NEEDED       = 1
+	DT_PLTRELSZ     = 2
+	DT_PLTGOT       = 3
+	DT_HASH         = 4
+	DT_STRTAB       = 5
+	DT_SYMTAB       = 6
+	DT_RELA         = 7
+	DT_RELASZ       = 8
+	DT_JMPREL       = 23
+	DT_INIT_ARRAY   = 25
+	DT_FINI_ARRAY   = 26
+	DT_INIT_ARRAYSZ = 27
+	DT_FINI_ARRAYSZ = 28
+	DT_GNU_HASH     = 0x6ffffef5
 )
+
+// DynamicEntry represents a 64-bit dynamic section entry (Elf64_Dyn).
+type DynamicEntry struct {
+	Tag uint64 // Dynamic entry type
+	Val uint64 // Value or pointer
+}
 
 // ELFHeader represents the main ELF header structure (e_ident + rest of header).
 // We assume 64-bit for the rest of the header fields as per the project context (ARM64).
@@ -101,7 +124,12 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 		return fmt.Errorf("program header fix failed: %w", err)
 	}
 
-	// 4. Rewrite the fixed PHT back to the file
+	// 4. Fix Dynamic Section
+	if err := fixDynamicSection(file, phdrs, baseAddr); err != nil {
+		return fmt.Errorf("dynamic section fix failed: %w", err)
+	}
+
+	// 5. Rewrite the fixed PHT back to the file
 	if _, err := file.Seek(int64(header.PhdrOffset), io.SeekStart); err != nil {
 		return fmt.Errorf("failed to seek to program header table for writing: %w", err)
 	}
@@ -115,6 +143,71 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 	}
 	if err := binary.Write(file, binary.LittleEndian, &header); err != nil {
 		return fmt.Errorf("failed to write fixed ELF header: %w", err)
+	}
+
+	return nil
+}
+
+// fixDynamicSection reads the dynamic section, fixes runtime pointers, and writes it back.
+func fixDynamicSection(file *os.File, phdrs []ProgramHeader, baseAddr uint64) error {
+	var dynamicPhdr *ProgramHeader
+	for i := range phdrs {
+		if phdrs[i].Type == PT_DYNAMIC {
+			dynamicPhdr = &phdrs[i]
+			break
+		}
+	}
+
+	if dynamicPhdr == nil {
+		// Not all SOs have a dynamic section (e.g., static linking), so this is not an error.
+		return nil
+	}
+
+	// Calculate the number of entries. Memsz is the size of the dynamic array.
+	entryCount := dynamicPhdr.Memsz / 16 // sizeof(Elf64_Dyn) is 16 bytes
+
+	if entryCount == 0 {
+		return fmt.Errorf("dynamic section has zero size")
+	}
+
+	// Read the dynamic section content
+	dynamicEntries := make([]DynamicEntry, entryCount)
+
+	// Seek to the file offset of the dynamic section
+	if _, err := file.Seek(int64(dynamicPhdr.Offset), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to dynamic section: %w", err)
+	}
+
+	if err := binary.Read(file, binary.LittleEndian, &dynamicEntries); err != nil {
+		return fmt.Errorf("failed to read dynamic section: %w", err)
+	}
+
+	// Fix pointers in the dynamic section
+	for i := range dynamicEntries {
+		entry := &dynamicEntries[i]
+
+		// Only fix entries that are pointers (DT_PTR tags)
+		// For a dumped SO, any address-related tag needs to be converted from runtime to relative.
+		switch entry.Tag {
+		case DT_PLTGOT, DT_HASH, DT_GNU_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_JMPREL, DT_INIT_ARRAY, DT_FINI_ARRAY:
+			// Check if the pointer is a runtime address (i.e., greater than the base address)
+			if entry.Val >= baseAddr {
+				entry.Val -= baseAddr
+			}
+		case DT_PLTRELSZ, DT_RELASZ, DT_INIT_ARRAYSZ, DT_FINI_ARRAYSZ:
+			// Size tags are values, not pointers, so no conversion needed.
+		case DT_NULL:
+			// End of dynamic section, stop processing.
+			break
+		}
+	}
+
+	// Rewrite the fixed dynamic section back to the file
+	if _, err := file.Seek(int64(dynamicPhdr.Offset), io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek to dynamic section for writing: %w", err)
+	}
+	if err := binary.Write(file, binary.LittleEndian, dynamicEntries); err != nil {
+		return fmt.Errorf("failed to write fixed dynamic section: %w", err)
 	}
 
 	return nil
