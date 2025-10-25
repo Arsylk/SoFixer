@@ -10,6 +10,7 @@
 #define ELFREBUILDER_H
 
 #include "ObElfReader.h"
+#include <LIEF/LIEF.hpp>
 #include <string>
 #include <vector>
 

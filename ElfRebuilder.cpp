@@ -4,12 +4,13 @@
 #include "ElfRebuilder.h"
 #include "FDebug.h"
 #include "elf.h"
-#include "macros.h"
+#include <LIEF/LIEF.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -994,6 +995,20 @@ public:
     // Fix ELF header
     if (!FixElfHeader(shdr_offset)) {
       FLOGE("Failed to fix ELF header");
+      return false;
+    }
+
+    // LIEF integration: parse the rebuilt binary for validation
+    try {
+      std::vector<uint8_t> data_vec(rebuild_data_.get(), rebuild_data_.get() + rebuild_size_);
+      auto lief_binary = LIEF::ELF::Parser::parse(data_vec);
+      if (!lief_binary) {
+        FLOGE("Failed to parse rebuilt binary with LIEF");
+        return false;
+      }
+      FLOGD("LIEF validation successful");
+    } catch (const std::exception& e) {
+      FLOGE("LIEF validation failed: %s", e.what());
       return false;
     }
 

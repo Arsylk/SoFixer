@@ -42,7 +42,11 @@ void ObElfReader::FixDumpSoPhdr() {
     for(auto i = 0; i < phdr_num_; i++) {
         phdr->p_paddr = phdr->p_vaddr;
         phdr->p_filesz = phdr->p_memsz;     // expend filesize to memsiz
-        phdr->p_offset = phdr->p_vaddr;     // since elf has been loaded. just expand file data to dump memory data
+        if (dump_so_base_ != 0) {
+            phdr->p_offset = phdr->p_vaddr - dump_so_base_;  // Adjust offset relative to dump base
+        } else {
+            phdr->p_offset = phdr->p_vaddr;     // since elf has been loaded. just expand file data to dump memory data
+        }
 //            phdr->p_flags = 0                 // TODO fix flags by PT_TYPE
         phdr++;
     }
