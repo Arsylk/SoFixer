@@ -206,6 +206,14 @@ func FixELFHeaders(filePath string, baseAddr uint64) error {
 	return nil
 }
 
+// GNUHashHeader represents the initial part of the DT_GNU_HASH table.
+type GNUHashHeader struct {
+	Nbuckets  uint32
+	Symndx    uint32 // Index of the first symbol in .dynsym that is NOT a local symbol (usually 1)
+	Maskwords uint32
+	Shift2    uint32
+}
+
 // SectionInfo is a helper struct to build the SHT.
 type SectionInfo struct {
 	Name      string
@@ -296,6 +304,15 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		})
 	}
 
+	// 2. Calculate symbol count
+	symCount, err := calculateSymbolCount(file, dynMap)
+	if err != nil {
+		// If calculation fails, fall back to heuristic or return error
+		if symCount == 0 {
+			return fmt.Errorf("failed to calculate symbol count: %w", err)
+		}
+	}
+
 	// --- Section Reconstruction Logic ---
 
 	// Add .dynstr
@@ -304,14 +321,8 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	}
 
 	// Add .dynsym
-	if dynMap[DT_SYMTAB] != 0 && dynMap[DT_SYMENT] != 0 {
-		// We need to estimate the size of the symbol table.
-		// For now, we'll use a heuristic: (DT_STRSZ / 10) * DT_SYMENT
-		// This is a rough estimate, but better than a fixed size.
-		symtabSize := (dynMap[DT_STRSZ] / 10) * dynMap[DT_SYMENT]
-		if symtabSize == 0 {
-			symtabSize = 0x1000 // Default if estimate is zero
-		}
+	if dynMap[DT_SYMTAB] != 0 && dynMap[DT_SYMENT] != 0 && symCount > 0 {
+		symtabSize := symCount * dynMap[DT_SYMENT]
 		addSection(".dynsym", SHT_DYNSYM, SHF_ALLOC, dynMap[DT_SYMTAB], symtabSize, 8, dynMap[DT_SYMENT])
 	}
 
@@ -487,6 +498,101 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	header.Shstrndx = uint16(shstrtabSectionIndex)
 
 	return nil
+}
+
+// calculateSymbolCount reads the GNU Hash table and determines the total number of symbols.
+func calculateSymbolCount(file *os.File, dynMap map[uint64]uint64) (uint64, error) {
+	gnuHashOffset := dynMap[DT_GNU_HASH]
+	symtabOffset := dynMap[DT_SYMTAB]
+	symEntSize := dynMap[DT_SYMENT]
+
+	if gnuHashOffset == 0 || symtabOffset == 0 || symEntSize == 0 {
+		// Fallback to heuristic if GNU hash is missing or incomplete (though DT_SYMENT should be present)
+		if symtabOffset != 0 && dynMap[DT_STRSZ] != 0 {
+			return (dynMap[DT_STRSZ] / 10) * symEntSize, nil
+		}
+		return 0, fmt.Errorf("missing DT_GNU_HASH or DT_SYMTAB/DT_SYMENT")
+	}
+
+	// 1. Read GNU Hash Header
+	var header GNUHashHeader
+	if _, err := file.Seek(int64(gnuHashOffset), io.SeekStart); err != nil {
+		return 0, fmt.Errorf("failed to seek to GNU hash table: %w", err)
+	}
+	if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
+		return 0, fmt.Errorf("failed to read GNU hash header: %w", err)
+	}
+
+	// 2. Calculate pointers to buckets and chains
+	// The hash table layout is: Header (16 bytes) -> Bloom Filter (Maskwords * 8 bytes) -> Buckets -> Chains
+	bloomSize := header.Maskwords * 8
+	bucketsOffset := gnuHashOffset + 16 + uint64(bloomSize)
+	chainsOffset := bucketsOffset + uint64(header.Nbuckets*4) // Buckets are uint32 (4 bytes)
+
+	// 3. Read Buckets
+	buckets := make([]uint32, header.Nbuckets)
+	if _, err := file.Seek(int64(bucketsOffset), io.SeekStart); err != nil {
+		return 0, fmt.Errorf("failed to seek to GNU hash buckets: %w", err)
+	}
+	if err := binary.Read(file, binary.LittleEndian, &buckets); err != nil {
+		return 0, fmt.Errorf("failed to read GNU hash buckets: %w", err)
+	}
+
+	// 4. Determine max symbol index by checking the chains
+	// The chain array starts at the index of the first non-local symbol (header.Symndx)
+	// The chain array contains the hash value of the symbol, with the LSB set for the last symbol in the chain.
+	// The chain array is indexed by (symbol_index - header.Symndx).
+
+	// We need to find the maximum index referenced by the buckets/chains.
+	// The chain array itself starts at chainsOffset.
+	// The size of the chain array is unknown, so we must read it dynamically.
+
+	// The maximum symbol index is the largest index found in the buckets/chains.
+	maxSymIndex := uint64(header.Symndx)
+
+	// The chain array is a sequence of uint32s. We need to read enough to cover all symbols.
+	// Since we don't know the total number of symbols, we'll read a large chunk and rely on the LSB terminator.
+	// We'll read up to 0x10000 bytes (a safe limit for a small SO).
+	maxChainReadSize := uint64(0x10000)
+	chainData := make([]byte, maxChainReadSize)
+	if _, err := file.Seek(int64(chainsOffset), io.SeekStart); err != nil {
+		return 0, fmt.Errorf("failed to seek to GNU hash chains: %w", err)
+	}
+	n, err := file.Read(chainData)
+	if err != nil && err != io.EOF {
+		return 0, fmt.Errorf("failed to read GNU hash chains: %w", err)
+	}
+
+	// Convert chain data to uint32 slice
+	chain := make([]uint32, n/4)
+	for i := 0; i < len(chain); i++ {
+		chain[i] = binary.LittleEndian.Uint32(chainData[i*4 : (i+1)*4])
+	}
+
+	// Iterate through buckets to find the max symbol index
+	for _, bucketIndex := range buckets {
+		if bucketIndex >= header.Symndx {
+			// Start of a chain. The chain index is (symbol_index - header.Symndx).
+			chainStart := bucketIndex - header.Symndx
+			currentSymIndex := uint64(bucketIndex)
+
+			// Follow the chain until the LSB is set (terminator)
+			for chainIndex := chainStart; chainIndex < uint32(len(chain)); chainIndex++ {
+				if currentSymIndex >= maxSymIndex {
+					maxSymIndex = currentSymIndex
+				}
+
+				if chain[chainIndex]&1 != 0 {
+					// Last symbol in chain
+					break
+				}
+				currentSymIndex++
+			}
+		}
+	}
+
+	// Total symbol count is maxSymIndex + 1 (since it's 0-indexed)
+	return maxSymIndex + 1, nil
 }
 
 // fixRelocations reads the relocation tables and fixes the pointers they reference.
