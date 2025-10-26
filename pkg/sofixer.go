@@ -55,6 +55,7 @@ const (
 	SHT_FINI_ARRAY = 15
 	SHT_DYNSYM     = 11
 	SHT_GNU_HASH   = 0x6ffffff6
+	SHT_NOBITS     = 8 // Added SHT_NOBITS
 
 	// Section Header Flags (SHF)
 	SHF_WRITE     = 0x1
@@ -295,7 +296,7 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		})
 	}
 
-	// Add sections based on dynamic entries (pointers are already relative offsets)
+	// --- Section Reconstruction Logic ---
 
 	// Add .dynstr
 	if dynMap[DT_STRTAB] != 0 && dynMap[DT_STRSZ] != 0 {
@@ -343,17 +344,47 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		addSection(".fini_array", SHT_FINI_ARRAY, SHF_ALLOC|SHF_WRITE, dynMap[DT_FINI_ARRAY], dynMap[DT_FINI_ARRAYSZ], 8, 8)
 	}
 
-	// Add .text (approximation: first PT_LOAD segment)
-	// We use the first PT_LOAD segment that is executable (R E)
-	var textPhdr *ProgramHeader
+	// --- Deduce Missing Sections from PHT and Dynamic Pointers ---
+
+	// Find the executable segment (R E) and the writable segment (RW)
+	var execPhdr *ProgramHeader
+	var rwPhdr *ProgramHeader
 	for _, phdr := range phdrs {
-		if phdr.Type == PT_LOAD && (phdr.Flags&SHF_EXECINSTR) != 0 {
-			textPhdr = &phdr
-			break
+		if phdr.Type == PT_LOAD {
+			if (phdr.Flags&SHF_EXECINSTR) != 0 && (phdr.Flags&SHF_WRITE) == 0 {
+				execPhdr = &phdr
+			}
+			if (phdr.Flags & SHF_WRITE) != 0 {
+				rwPhdr = &phdr
+			}
 		}
 	}
-	if textPhdr != nil {
-		addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, textPhdr.Vaddr, textPhdr.Filesz, 16, 0)
+
+	// 1. Add .text (from executable segment)
+	if execPhdr != nil {
+		// .text is the executable part of the first LOAD segment.
+		// We approximate its size by finding the end of the last known section in the executable segment.
+		// For simplicity, we use the entire executable segment's file size for now.
+		addSection(".text", SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, execPhdr.Vaddr, execPhdr.Filesz, 16, 0)
+	}
+
+	// 2. Add .got (if not covered by dynamic pointers)
+	if dynMap[DT_PLTGOT] != 0 {
+		// .got starts at DT_PLTGOT.
+		// The size is estimated by the number of PLT relocations * 8 bytes/entry + 3 reserved entries.
+		pltRelocCount := dynMap[DT_PLTRELSZ] / 24 // 24 bytes per Elf64_Rela
+		gotSize := (pltRelocCount + 3) * 8
+		addSection(".got", SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, dynMap[DT_PLTGOT], gotSize, 8, 8)
+	}
+
+	// 3. Add .bss (from writable segment)
+	if rwPhdr != nil {
+		// BSS starts at the end of the file content (Filesz) and extends to Memsz.
+		bssStart := rwPhdr.Vaddr + rwPhdr.Filesz
+		bssSize := rwPhdr.Memsz - rwPhdr.Filesz
+		if bssSize > 0 {
+			addSection(".bss", SHT_NOBITS, SHF_ALLOC|SHF_WRITE, bssStart, bssSize, 16, 0)
+		}
 	}
 
 	// Add .shstrtab (Section Header String Table)
@@ -377,9 +408,7 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 	// Fix sh_link and sh_info
 	dynsymIndex := nameToIndex[".dynsym"]
 	dynstrIndex := nameToIndex[".dynstr"]
-	// We don't have a .plt section, but we can approximate its index for the .rela.plt info field.
-	// For now, we'll use the index of the .text section as a placeholder for the .plt section's info link.
-	pltIndex := nameToIndex[".text"]
+	pltIndex := nameToIndex[".text"] // Placeholder for .plt, using .text index
 
 	for i := range sections {
 		sec := &sections[i]
@@ -387,7 +416,6 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 		switch sec.Name {
 		case ".dynsym":
 			sec.Link = dynstrIndex
-			// Info field for SHT_DYNSYM is the index of the first non-local symbol (usually 1)
 			sec.Info = 1
 		case ".gnu.hash":
 			sec.Link = dynsymIndex
@@ -397,7 +425,7 @@ func rebuildSectionHeaders(filePath string, file *os.File, header *ELFHeader, ph
 			sec.Link = dynsymIndex
 		case ".rela.plt":
 			sec.Link = dynsymIndex
-			sec.Info = pltIndex // Link to .text section as a placeholder for .plt
+			sec.Info = pltIndex
 		}
 	}
 
